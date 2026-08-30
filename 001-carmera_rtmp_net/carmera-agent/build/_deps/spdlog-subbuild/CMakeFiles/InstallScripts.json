@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"E:/cnb/git/SOC-Agent/001-carmera_rtmp_net/carmera-agent/build/_deps/spdlog-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

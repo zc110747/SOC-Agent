@@ -1,0 +1,23 @@
+# Camera Agent configuration
+# Precedence: CLI arguments > this file > built-in defaults.
+
+camera:
+  id: 0
+  width: 1280
+  height: 720
+  fps: 30
+
+encoder:
+  codec: h264
+  bitrate: 4000          # kbps
+  keyframe_interval: 30  # frames
+
+stream:
+  id: camera01
+
+rtsp:
+  server: 127.0.0.1
+  port: 8554
+
+device_id: camera01
+log_level: info
