@@ -108,5 +108,5 @@ if ($LASTEXITCODE -ne 0) { throw "Build failed ($LASTEXITCODE)." }
 ""
 "Build OK: $Build"
 "Next:"
-"  & '$Build\camera-agent.exe' --list"
+"  & '$Build\src\camera-agent.exe' --list"
 "  & ctest --test-dir '$Build' --output-on-failure"

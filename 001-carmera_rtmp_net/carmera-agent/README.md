@@ -75,12 +75,14 @@ camera-agent/
 ## 环境依赖
 
 - **Windows + Visual Studio 2022**（含 "Desktop development with C++" 工作负载，带 MSVC / Windows SDK / CMake / Ninja）。
-- **GStreamer 1.0（MSVC 版 runtime + devel）**，安装到 `C:\Program Files\gstreamer\1.0\msvc_x86_64`。需把其 `bin` 加入 `PATH`（运行 agent 时加载插件）。
-- **MediaMTX**（RTSP Server），`mediamtx.exe` 加入 `PATH`（或放已知目录，见一键启动脚本自动探测）。
-- **ffmpeg/ffplay**（仅验证/观看用），加入 `PATH`。
+- **GStreamer 1.0（MSVC 版 runtime + devel）**。仓库**不硬编码**路径：CMake 按 `-DGSTREAMER_ROOT` → `$ENV{GSTREAMER_ROOT}` → 官方安装程序写入的环境变量 → `PATH` 上的 `gst-launch-1.0`/`pkg-config` → 通用默认前缀的顺序定位，详见 `ENV_SETUP.md`。运行 agent 时需把其 `bin` 加入 `PATH` 以加载插件。
+- **MediaMTX**（RTSP Server）：`mediamtx.exe` 加入 `PATH`。
+- **ffmpeg/ffplay**（仅验证/观看用）：加入 `PATH`。
 - 依赖仅 `spdlog`（CMake `FetchContent` 自动拉取），无其他第三方依赖。
 
-> 本机真实摄像头为 "UVC Control"，原生 **240×240 @ 8fps**；默认 1280×720@30 协商失败，必须显式传 `--width 240 --height 240 --fps 8` 或用 `--auto` 自动协商。
+> 外部工具一律按**裸名称**调用，因此必须在本机 `PATH` 上。双击 `.bat` 时继承的是注册表里的系统/用户 PATH，**不是**已开终端的 PATH —— 改完 PATH 要重开终端才生效。
+
+> 摄像头规格因机而异，推荐 `--auto` 让设备自己协商原生格式。本机实测：LRCP USB2.0（index 1）协商为 **1280×720@30**；内置 Integrated Camera（index 0）为 1280×720@10。实际索引请用 `camera-agent --list` 查看。
 
 ---
 
@@ -197,8 +199,8 @@ MediaMTX 从项目根目录启动时会自动加载本文件。`all_others` + �
 # 列出摄像头能力
 camera-agent --list
 
-# 显式分辨率推流（本机 UVC 必须如此，否则协商失败进重连）
-camera-agent --camera 0 --width 240 --height 240 --fps 8 --stream camera01
+# 指定分辨率推流（强制 caps；设备不支持该模式会协商失败进重连）
+camera-agent --camera 1 --width 640 --height 480 --fps 30 --stream camera01
 
 # 自动协商（原生直通，无需手填分辨率）
 camera-agent --auto --source mfvideosrc --stream camera01
@@ -213,16 +215,23 @@ camera-agent --auto --source mfvideosrc --latency-probe --duration 8
 ### 一键启动（demo：MediaMTX + agent + ffplay）
 
 ```bat
-start-camera-agent.bat            :: 默认启动
+start-camera-agent.bat            :: 默认启动（CAMERA_ID=1 + --auto）
 start-camera-agent.bat --no-pause :: 不暂停
 start-camera-agent.bat --latency-probe :: 透传延迟探针
+start-camera-agent.bat --camera 3 --auto          :: 换摄像头
+start-camera-agent.bat --camera 1 --no-auto --width 640 --height 480 --fps 30
 ```
 
-流程：(1) 预检工具与二进制；(2) `taskkill` 停掉残留 mediamtx/camera-agent/ffplay；(3) 顺序 `start` mediamtx → camera-agent → ffplay（ffplay 自动开观看窗口）；(4) 轮询各组件状态并打印 RTSP 地址与访问方式。
+所有参数既能用命令行传，也能用环境变量预设（`CAMERA_ID` / `CAMERA_AUTO` / `CAMERA_WIDTH` / `CAMERA_HEIGHT` / `CAMERA_FPS` / `CAMERA_SOURCE` / `STREAM_ID` / `RTSP_HOST` / `RTSP_PORT`），优先级：命令行 > 环境变量 > 默认值。
 
-- 外部工具（mediamtx/ffplay/ffmpeg）走 PATH；双击 `.bat` 时若不在系统 PATH，会自动探测已知安装目录（`D:\data\agent-tools\...`）并 prepend，故双击也能用。
+流程：(1) 预检工具与二进制；(2) `taskkill` 停掉残留 mediamtx/camera-agent/ffplay；(3) 顺序 `start` mediamtx → camera-agent；(4) 轮询 agent 日志确认 `STREAMING`、再确认 mediamtx 已接受发布者；(5) **确认就绪后才启动 ffplay**；(6) 打印 RTSP 地址与访问方式。
+
+- 外部工具（mediamtx/ffplay/ffmpeg）按裸名称调用，**必须在 PATH 上**，脚本内不含任何机器路径。
 - 日志重定向到 `tests\finished\`（agent.log / mediamtx.log）。
-- 观看端 ffplay 已加低延迟旗标组：`-rtsp_transport tcp -rtsp_flags nobuffer -fflags nobuffer -flags low_delay -probesize 32768 -analyzeduration 0 -framedrop`。
+- 观看端 ffplay 低延迟旗标组：`-rtsp_transport tcp -fflags nobuffer -flags low_delay -probesize 32768 -analyzeduration 0 -framedrop -max_delay 0`。
+  ⚠️ 不要加 `-rtsp_flags nobuffer`：`rtsp_flags` 不接受该值，ffplay 会直接 `Invalid argument` 退出、窗口永远不出现。
+
+> 为什么必须"先等流就绪再开 ffplay"：agent 报 `STREAMING` 比 mediamtx 真正注册路径早约 1 秒，此时 ffplay 发 DESCRIBE 会拿到 `404 Not Found` 并立即退出。
 
 ---
 

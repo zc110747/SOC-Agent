@@ -38,6 +38,12 @@ if(CAMERA_AGENT_BACKEND STREQUAL "gstreamer")
   target_compile_definitions(camera-agent PRIVATE
     CAMERA_AGENT_BACKEND_GSTREAMER
     CAMERA_AGENT_BACKEND_NAME="gstreamer")
+  # Let the GStreamer DLLs be found when launching from the IDE, without
+  # requiring a machine-specific PATH edit.
+  if(GSTREAMER_RUNTIME_DIR)
+    set_target_properties(camera-agent PROPERTIES
+      VS_DEBUGGER_ENVIRONMENT "PATH=${GSTREAMER_RUNTIME_DIR};$ENV{PATH}")
+  endif()
 else()
   target_compile_definitions(camera-agent PRIVATE
     CAMERA_AGENT_BACKEND_SIM

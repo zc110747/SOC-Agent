@@ -14,7 +14,7 @@
 | 构建系统 | CMake 4.2.1 / Ninja 1.13.2 | ✅ 已具备 |
 | 源码拉取 | Git 2.55.0（GitHub 可达） | ✅ 已具备 |
 | 日志库 spdlog | FetchContent 自动拉 v1.14.1 | ✅ 自动（需网络） |
-| **多媒体框架** | **GStreamer 1.0 MSVC devel** | ❌ **必须安装** |
+| **多媒体框架** | **GStreamer 1.28.6 MSVC x86_64** | ✅ 已安装（`D:\software\msvc_x86_64\gstreamer`） |
 | RTSP 服务器 | MediaMTX | ⭕ 验收用（建议） |
 | 播放器 | FFmpeg / ffplay | ⭕ 验收用（建议） |
 
@@ -52,31 +52,57 @@
 | 直链（MSVC x86_64, VS2022 Release CRT） | https://gstreamer.freedesktop.org/data/pkg/windows/1.28.6/msvc/gstreamer-1.0-msvc-x86_64-1.28.6.exe |
 | 历史版本目录 | https://gstreamer.freedesktop.org/data/pkg/windows/ |
 | 安装类型 | **devel**（runtime + 开发头文件）；1.28 起 runtime/devel 合并为单个 exe，用 `/TYPE=devel` 指定 |
-| 建议安装目录 | **`C:\gstreamer\1.0\msvc_x86_64`** |
+| 建议安装目录 | 任意；本项目**不再硬编码**任何路径 |
 
-> ⚠️ **为什么必须指定安装目录**
-> `CMakeLists.txt:29` 中 `GSTREAMER_ROOT` 的默认值就是 `C:/gstreamer/1.0/msvc_x86_64`。
-> 1.28 起安装程序默认路径改为 `%ProgramFiles%\gstreamer\1.0\msvc_x86_64`
-> （即 `C:\Program Files\gstreamer\1.0\msvc_x86_64`），与项目默认值不一致。
-> 装到 `C:\gstreamer\1.0\msvc_x86_64` 可免去每次传 `-DGSTREAMER_ROOT=...`。
-> 如果你装到别处，构建时加参数即可：
-> `cmake -S . -B build-msvc -G "Visual Studio 17 2022" -A x64 -DGSTREAMER_ROOT="C:/Program Files/gstreamer/1.0/msvc_x86_64"`
+#### ✅ 路径约定：仓库零硬编码，机器侧用环境变量
 
-**静默安装命令（管理员 PowerShell）：**
+`CMakeLists.txt` **不写死任何机器相关路径**。GStreamer 安装根目录按以下顺序解析
+（先命中先用），因此同一份代码在任意电脑、任意安装位置都能直接 `cmake -S . -B build`：
 
-```powershell
-& "$env:USERPROFILE\Downloads\gstreamer-1.0-msvc-x86_64-1.28.6.exe" `
-   /DIR=C:\gstreamer\1.0\msvc_x86_64 /TYPE=devel /ALLUSERS /SILENT /NORESTART
+| 顺序 | 来源 | 说明 |
+|------|------|------|
+| 1 | `-DGSTREAMER_ROOT=<path>` | 显式指定，优先级最高，仅存在于本地构建命令里 |
+| 2 | `$ENV{GSTREAMER_ROOT}` | **推荐**：每台机器设一次，仓库无需改动 |
+| 3 | `$ENV{GSTREAMER_1_0_ROOT_MSVC_X86_64__Plus}` / `..._MSVC_X86_64` / `..._X86_64` | GStreamer 官方安装程序自动写入的变量名，装完即用 |
+| 4 | `PATH` 里的 `gst-launch-1.0` / `gst-inspect-1.0` / `pkg-config` | 由 `<...>\bin` 反推安装根目录 |
+| 5 | 若干通用默认前缀 | `%ProgramFiles%\gstreamer\...`、`C:\gstreamer\...`、`/usr` 等 |
+
+两种目录布局都会自动识别，无需区分：
+
+```
+<root>/include/gstreamer-1.0/gst/gst.h          ← 扁平布局（本机即此）
+<root>/1.0/msvc_x86_64/include/gstreamer-1.0/   ← 带版本布局
 ```
 
-**安装后把 bin 加入 PATH（用户级，无需管理员）：**
+候选路径**必须真实包含 `include/gstreamer-1.0/gst/gst.h` 才会被采纳**；全部落空时会
+直接 `FATAL_ERROR` 并给出修复指引，不再像旧版那样静默回退到一个不存在的路径、
+最终抛出难以定位的 `gio/gio.h` 报错。
+
+**每台新机器只需做一次（用户级，无需管理员）：**
 
 ```powershell
-[Environment]::SetEnvironmentVariable(
-  "Path",
-  [Environment]::GetEnvironmentVariable("Path", "User") + ";C:\gstreamer\1.0\msvc_x86_64\bin",
-  "User")
+$gst = 'D:\software\msvc_x86_64\gstreamer'      # ← 改成你本机的实际路径
+
+[Environment]::SetEnvironmentVariable('GSTREAMER_ROOT', $gst, 'User')
+
+# 把 bin 加进 PATH：运行时要加载 GStreamer DLL
+$bin  = "$gst\bin"
+$up   = [Environment]::GetEnvironmentVariable('Path','User')
+if (-not (($up -split ';') -contains $bin)) {
+  [Environment]::SetEnvironmentVariable('Path', "$up;$bin", 'User')
+}
 ```
+
+> 设置后**需要新开一个终端**（已运行的进程不会重读注册表）才生效。
+
+**头文件/库由 pkg-config 自动展开（不再手工拼 include 目录）**
+
+GStreamer 自带的 `pkg-config.exe` 位于 `<root>\bin`，其 `.pc` 文件使用
+`prefix=${pcfiledir}/../..` 相对定位，因此**移到任何目录都可用**。CMake 会自动把
+`<root>\lib\pkgconfig` 注入 `PKG_CONFIG_PATH`，再由它给出准确的包含目录与链接库，
+`glib-2.0`、`gio`、`lib/glib-2.0/include`（`glibconfig.h` 所在）等一并解析到位 ——
+这正是 `gio/gio.h` 能被引到的原因。若某台机器没有 pkg-config，会回退到按标准布局
+逐个校验目录的方式。
 
 #### 必须存在的 GStreamer 元素
 
