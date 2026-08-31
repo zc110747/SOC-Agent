@@ -14,6 +14,7 @@ REM   build_oneclick.bat clean        wipe build-msvc first, then build
 REM   build_oneclick.bat gstreamer clean
 
 set ROOT=%~dp0
+if "%ROOT:~-1%"=="\" set ROOT=%ROOT:~0,-1%
 cd /d "%ROOT%"
 
 set BACKEND=gstreamer
@@ -37,7 +38,7 @@ if exist %VSWHERE% (
 )
 if not defined VSPATH set VSPATH=D:\Software\vs
 if not exist "%VSPATH%" (
-  echo [ERROR] Visual Studio not found (looked in '%VSPATH%').
+  echo [ERROR] Visual Studio not found - looked in %VSPATH%
   echo         Install VS2022 with the "Desktop development with C++" workload.
   pause
   exit /b 1
@@ -64,7 +65,7 @@ where cmake >nul 2>&1 && echo  cmake  : OK || echo  cmake  : MISSING
 where ninja >nul 2>&1 && echo  ninja  : OK || echo  ninja  : MISSING
 echo ============================================================
 
-set BUILD=%ROOT%build-msvc
+set BUILD=%ROOT%\build-msvc
 if "%CLEAN%"=="1" (
   echo --- clean: removing %BUILD% ---
   if exist "%BUILD%" rmdir /s /q "%BUILD%"

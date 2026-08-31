@@ -18,7 +18,8 @@ REM registry, NOT the PATH of an already-open terminal. Add the tools to the
 REM system/user environment (or run from a shell where they are on PATH).
 
 set ROOT=%~dp0
-set FINISHED=%ROOT%tests\finished
+if "%ROOT:~-1%"=="\" set ROOT=%ROOT:~0,-1%
+set FINISHED=%ROOT%\tests\finished
 if not exist "%FINISHED%" mkdir "%FINISHED%"
 
 REM Run from the project root so mediamtx finds mediamtx.yml and
@@ -32,12 +33,20 @@ for %%a in (%*) do (
   if /i "%%a"=="--no-pause" set NOPAUSE=1
 )
 
+REM ---- auto-detect external tools so a double-click works without them on PATH ----
+REM mediamtx / ffplay / ffmpeg only live in the interactive-shell PATH, not the
+REM system PATH a .bat inherits on double-click. Probe the known install dirs and
+REM prepend them so the launched programs can find them.
+call :add_tool_path mediamtx "D:\data\agent-tools\mediamtx_v1.20.1_windows_amd64"
+call :add_tool_path ffplay  "D:\data\agent-tools\ffmpeg-master-latest-win64-gpl-shared\bin"
+call :add_tool_path ffmpeg  "D:\data\agent-tools\ffmpeg-master-latest-win64-gpl-shared\bin"
+
 REM ---- (1) pre-check: project binary ----
-set EXE=%ROOT%build-msvc\src\camera-agent.exe
+set EXE=%ROOT%\build-msvc\src\camera-agent.exe
 if not exist "%EXE%" (
   echo [ERROR] camera-agent.exe not found at:
   echo         %EXE%
-  echo         Build it first:  build_oneclick.bat   (or: build_oneclick.bat sim)
+  echo         Build it first: build_oneclick.bat  - or: build_oneclick.bat sim
   goto :fail
 )
 echo [OK]    camera-agent.exe
@@ -51,23 +60,24 @@ echo [1/3] Stopping running programs: mediamtx / camera-agent / ffplay
 taskkill /F /IM mediamtx.exe >nul 2>&1
 taskkill /F /IM camera-agent.exe >nul 2>&1
 taskkill /F /IM ffplay.exe >nul 2>&1
-timeout /t 1 >nul
+C:\Windows\System32\timeout.exe /t 1 >nul 2>&1
 
 REM ---- (3) start programs in order ----
 echo [2/3] Starting MediaMTX (RTSP server) ...
-start "MediaMTX" cmd /c "mediamtx > "%FINISHED%\mediamtx.log" 2>&1"
+start "MediaMTX" cmd /c "mediamtx > %FINISHED%\mediamtx.log 2>&1"
 
 REM wait until mediamtx is ready (poll its log)
 set MT_READY=0
 for /l %%i in (1,1,15) do (
-  timeout /t 1 >nul
-  findstr /i /c:"listener" /c:"8554" "%FINISHED%\mediamtx.log" >nul 2>&1 && ( set MT_READY=1 & goto :mt_ok )
+  if "!MT_READY!"=="0" (
+    C:\Windows\System32\timeout.exe /t 1 >nul 2>&1
+    findstr /i /c:"listener" /c:"8554" "%FINISHED%\mediamtx.log" >nul 2>&1 && set MT_READY=1
+  )
 )
-:mt_ok
 if "%MT_READY%"=="1" ( echo [OK]    mediamtx ready ) else ( echo [WARN]  mediamtx not ready - see tests\finished\mediamtx.log )
 
 echo [2/3] Starting camera-agent (push stream) ...
-start "camera-agent" cmd /c ""%EXE%" --camera 0 --width 240 --height 240 --fps 8 --stream camera01 --log-level info > "%FINISHED%\agent.log" 2>&1"
+start "camera-agent" cmd /c "%EXE% --camera 0 --width 240 --height 240 --fps 8 --stream camera01 --log-level info > %FINISHED%\agent.log 2>&1"
 
 echo [2/3] Starting ffplay (viewer) ...
 start "ffplay" ffplay -rtsp_transport tcp -fflags nobuffer -flags low_delay rtsp://127.0.0.1:8554/camera01
@@ -76,14 +86,15 @@ REM ---- (4) verify camera-agent status ----
 set ST_OK=0
 set ST_ERR=0
 for /l %%i in (1,1,15) do (
-  timeout /t 1 >nul
-  findstr /i /c:"STREAMING" "%FINISHED%\agent.log" >nul 2>&1 && ( set ST_OK=1 & goto :st_done )
-  findstr /i /c:"error" /c:"failed" /c:"not found" /c:"not installed" /c:"unable" "%FINISHED%\agent.log" >nul 2>&1 && ( set ST_ERR=1 & goto :st_done )
+  if "!ST_OK!"=="0" if "!ST_ERR!"=="0" (
+    C:\Windows\System32\timeout.exe /t 1 >nul 2>&1
+    findstr /i /c:"STREAMING" "%FINISHED%\agent.log" >nul 2>&1 && set ST_OK=1
+    findstr /i /c:"error" /c:"failed" /c:"not found" /c:"not installed" /c:"unable" "%FINISHED%\agent.log" >nul 2>&1 && set ST_ERR=1
+  )
 )
-:st_done
 if "%ST_OK%"=="1" ( echo [OK]    camera-agent STREAMING ) else (
   if "%ST_ERR%"=="1" (
-    echo [WARN]  camera-agent reported an error (no camera / GStreamer issue?):
+    echo [WARN]  camera-agent reported an error - no camera / GStreamer issue?
     echo         --- last lines of agent.log ---
     for /f "tokens=*" %%l in ('findstr /i /c:"error" /c:"failed" /c:"not found" /c:"not installed" /c:"unable" "%FINISHED%\agent.log"') do echo         %%l
   ) else (
@@ -103,13 +114,25 @@ echo ============================================================
 echo.
 goto :done
 
+:add_tool_path
+set "_t=%~1"
+set "_cand=%~2"
+where %_t% >nul 2>&1 && exit /b 0
+if exist "%_cand%\%_t%.exe" (
+  echo [AUTO]   found %_t% at %_cand%
+  set "PATH=%_cand%;%PATH%"
+) else (
+  echo [note]   %_t% not auto-detected at %_cand%
+)
+exit /b 0
+
 :need
 set "_t=%~1"
 where %_t% >nul 2>&1
 if errorlevel 1 (
   echo [ERROR] '%_t%' was not found on PATH.
   echo         This script inherits the system/user PATH from the registry.
-  echo         Add '%_t%' to PATH (System Properties - Environment Variables)
+  echo         Add '%_t%' to PATH - System Properties / Environment Variables
   echo         and reopen the terminal, or run from a shell where it is available.
   exit /b 1
 )
