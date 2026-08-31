@@ -36,7 +36,9 @@ bool StreamController::start() {
     pp_.bitrate           = cfg_.encoder.bitrate;
     pp_.keyframe_interval = cfg_.encoder.keyframe_interval;
     pp_.encoder           = cfg_.encoder.codec;
-    pp_.source            = "auto";
+    pp_.source            = cfg_.source.empty() ? "auto" : cfg_.source;
+    pp_.measure_latency   = cfg_.measure_latency;
+    pp_.auto_res          = cfg_.camera.auto_res;
 
     pipeline_->set_status_callback([this](StreamStatus s) { on_status(s); });
 
@@ -122,9 +124,18 @@ DeviceInfo StreamController::get_device_info() const {
     DeviceInfo di;
     di.device_id      = cfg_.device_id;
     di.device_name    = "Camera Agent";
-    di.width          = cfg_.camera.width;
-    di.height         = cfg_.camera.height;
-    di.fps            = cfg_.camera.fps;
+    // Prefer the actually-negotiated format (auto_res mode, or after caps settle);
+    // fall back to the configured values when negotiation hasn't completed yet.
+    int nw = 0, nh = 0, nf = 0;
+    if (pipeline_ && pipeline_->get_negotiated_resolution(nw, nh, nf)) {
+        di.width  = nw;
+        di.height = nh;
+        di.fps    = nf;
+    } else {
+        di.width  = cfg_.camera.width;
+        di.height = cfg_.camera.height;
+        di.fps    = cfg_.camera.fps;
+    }
     di.bitrate_kbps   = cfg_.encoder.bitrate;
     di.stream_status  = status_.load();
     di.camera_status  = (pipeline_ && pipeline_->is_running())

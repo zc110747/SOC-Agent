@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -30,14 +31,35 @@ bool element_available(const char* element) {
 }
 
 // Map the configured encoder name to a GStreamer element + options.
+//
+// Low-latency flags are applied for every encoder. NVENC (nvh264enc) by
+// default reorders B-frames and runs lookahead, which alone adds 300 ms ~ 1 s+
+// of glass-to-glass latency; `zerolatency=true` + `tune=ultra-low-latency` +
+// `bframes=0` removes the reordering delay. Property names verified with
+// `gst-inspect-1.0`.
 std::string encoder_element(const std::string& enc, int bitrate, int keyint) {
+    const std::string bit = " bitrate=" + std::to_string(bitrate);
     if (enc == "h264" || enc == "x264" || enc == "x264enc") {
-        return "x264enc name=enc bitrate=" + std::to_string(bitrate) +
+        return "x264enc name=enc" + bit +
                " key-int-max=" + std::to_string(keyint) +
-               " tune=zerolatency speed-preset=veryfast";
+               " tune=zerolatency speed-preset=veryfast bframes=0";
     }
-    // Treat as a hardware encoder element name (mfxh264enc / nvh264enc / ...).
-    return enc + " name=enc bitrate=" + std::to_string(bitrate);
+    // NVIDIA NVENC: zerolatency disables B-frame reorder; rc-lookahead=0 drops
+    // the lookahead window; repeat-sequence-header keeps every IDR self-contained
+    // so a reconnect (auto-resume) does not wait for the next keyframe.
+    if (enc.rfind("nv", 0) == 0) {
+        return enc + " name=enc" + bit +
+               " tune=ultra-low-latency zerolatency=true bframes=0"
+               " rc-lookahead=0 repeat-sequence-header=true";
+    }
+    // Intel MFX.
+    if (enc.rfind("mfx", 0) == 0) {
+        return enc + " name=enc" + bit +
+               " tune=low-latency bframes=0 rc-lookahead=0"
+               " repeat-sequence-header=true";
+    }
+    // Unknown hardware encoder: disable B-frames as a safe low-latency baseline.
+    return enc + " name=enc" + bit + " bframes=0";
 }
 
 // Pick the best Windows camera source. On this machine gst-device-monitor
@@ -57,7 +79,8 @@ std::string source_element(const std::string& src) {
     if (src == "ksvideosrc" || src == "ks")            name = "ksvideosrc";
     else if (src == "dshowvideosrc" || src == "dshow") name = "dshowvideosrc";
     else if (src == "mfvideosrc" || src == "mf")       name = "mfvideosrc";
-    else                                                name = pick_source(); // "auto" / unknown
+    else if (src == "auto" || src.empty())             name = pick_source();
+    else                                                name = src; // pass through any element name (e.g. videotestsrc)
     if (name.empty()) name = "dshowvideosrc"; // last resort; required-check reports missing
     return name;
 }
@@ -76,6 +99,82 @@ std::string pick_encoder() {
 }
 
 } // namespace
+
+// ---- Latency instrumentation (opt-in via PipelineParams.measure_latency) ----
+// Each frame's buffer is stamped with the wall-clock moment it passes three
+// pipeline boundaries, keyed by its (monotonic) PTS:
+//   stage 0: capture  - source element src pad      (raw frame out of camera)
+//   stage 1: encode   - encoder src pad             (H264 out)
+//   stage 2: push     - rtspclientsink sink pad      (just before network send)
+// Differences between consecutive stages give per-segment latency entirely
+// inside camera-agent. mediamtx / ffplay are deliberately NOT measured here.
+struct LatencyTracker {
+    std::mutex mtx;
+    // FIFO queues of wall-clock timestamps at each stage. Buffers flow 1:1 and
+    // in order through capture -> encode -> push, so the front of each queue is
+    // the same logical frame. We match by ORDER, not by PTS: the H264 encoder
+    // (re)stamps PTS, which would otherwise break per-frame keying.
+    std::deque<gint64> cap_q, enc_q, push_q;
+    gint64   sum_enc = 0, sum_push = 0, sum_total = 0;
+    uint64_t n = 0;
+    std::chrono::steady_clock::time_point last_log =
+        std::chrono::steady_clock::now();
+
+    void reset() {
+        std::lock_guard<std::mutex> l(mtx);
+        cap_q.clear(); enc_q.clear(); push_q.clear();
+        sum_enc = sum_push = sum_total = 0;
+        n = 0;
+    }
+
+    void push_stage(int stage, gint64 t) {
+        std::lock_guard<std::mutex> l(mtx);
+        auto& q = (stage == 0) ? cap_q : (stage == 1) ? enc_q : push_q;
+        q.push_back(t);
+        // Resync if a stage fell behind (e.g. a dropped buffer): drain all queues.
+        if (q.size() > 1024) { cap_q.clear(); enc_q.clear(); push_q.clear(); return; }
+        if (cap_q.empty() || enc_q.empty() || push_q.empty()) return;
+        const gint64 tc = cap_q.front(); cap_q.pop_front();
+        const gint64 te = enc_q.front(); enc_q.pop_front();
+        const gint64 tp = push_q.front(); push_q.pop_front();
+        sum_enc   += (te - tc);
+        sum_push  += (tp - te);
+        sum_total += (tp - tc);
+        ++n;
+    }
+
+    void maybe_log() {
+        std::lock_guard<std::mutex> l(mtx);
+        auto now = std::chrono::steady_clock::now();
+        const double dt =
+            std::chrono::duration<double>(now - last_log).count();
+        if (n > 0 && dt >= 1.0) {
+            CA_LOG_INFO("[latency] capture->encode={:.1f}ms  encode->push={:.1f}ms"
+                        "  total(capture->push)={:.1f}ms  (n={})",
+                        sum_enc  / (double)n / 1e6,
+                        sum_push / (double)n / 1e6,
+                        sum_total/ (double)n / 1e6,
+                        n);
+            sum_enc = sum_push = sum_total = 0;
+            n = 0;
+            last_log = now;
+        }
+    }
+};
+
+struct LatencyCbCtx {
+    LatencyTracker* t = nullptr;
+    int            stage = 0;
+};
+
+static GstPadProbeReturn latency_probe_cb(GstPad*, GstPadProbeInfo* info,
+                                          gpointer user) {
+    auto* ctx = static_cast<LatencyCbCtx*>(user);
+    GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buf) return GST_PAD_PROBE_OK;
+    ctx->t->push_stage(ctx->stage, (gint64)gst_util_get_timestamp());
+    return GST_PAD_PROBE_OK;
+}
 
 class GstVideoPipeline : public VideoPipeline {
 public:
@@ -109,16 +208,43 @@ public:
         // encoders such as nvh264enc accept NV12/Y444/... but NOT I420, so
         // pinning I420 here makes every HW encoder fail to link. Without it,
         // videoconvert negotiates whatever the chosen encoder supports.
-        const std::string desc =
-            src + " device-index=" + std::to_string(p.camera_id) +
-            " ! videoconvert" +
-            " ! video/x-raw,width=" + std::to_string(p.width) +
-            ",height=" + std::to_string(p.height) +
-            ",framerate=" + std::to_string(p.fps) + "/1" +
-            " ! " + encoder_element(enc_elem, p.bitrate, p.keyframe_interval) +
-            " ! h264parse" +
-            " ! rtspclientsink location=" + rtsp_url;
+        //
+        // `queue` between stages decouples capture / convert / encode / push into
+        // separate threads so a slow stage (HW encode) never blocks the camera
+        // thread, and caps the buffered depth at 2 frames so frames cannot pile
+        // up and inflate glass-to-glass latency. rtspclientsink latency=0 /
+        // rtx-time=0 disable its receive/RTX buffering.
+        const std::string q =
+            "queue max-size-buffers=2 max-size-bytes=0 max-size-time=0";
 
+        // When auto_res is requested, do NOT pin width/height/framerate. The
+        // camera (and GStreamer negotiation) then uses its native format -- the
+        // robust path for UVC devices whose only supported mode (e.g. 240x240@8fps)
+        // would otherwise fail the forced caps filter and spin the reconnect loop.
+        const std::string conv_out =
+            p.auto_res ? "" :
+            (" ! video/x-raw,width=" + std::to_string(p.width) +
+             ",height=" + std::to_string(p.height) +
+             ",framerate=" + std::to_string(p.fps) + "/1");
+
+        const std::string desc =
+            src + " name=cam" +
+            (src == "mfvideosrc" || src == "dshowvideosrc" || src == "ksvideosrc"
+                 ? " device-index=" + std::to_string(p.camera_id) : "") +
+            // videotestsrc (synthetic test source) is not live by default and
+            // would flood the pipeline unbounded; rate-limit it like a real
+            // camera so the latency probes measure a realistic, balanced flow.
+            (src == "videotestsrc" ? " is-live=true" : "") +
+            " ! " + q +
+            " ! videoconvert name=conv" + conv_out +
+            " ! " + q +
+            " ! " + encoder_element(enc_elem, p.bitrate, p.keyframe_interval) +
+            " ! " + q +
+            " ! h264parse name=parse" +
+            " ! rtspclientsink name=sink location=" + rtsp_url + " latency=0 rtx-time=0";
+
+        if (p.auto_res)
+            CA_LOG_INFO("Auto-resolution: not forcing caps; camera negotiates native format");
         CA_LOG_INFO("Pipeline: {}", desc);
 
         GError* err = nullptr;
@@ -142,6 +268,36 @@ public:
             gst_object_unref(enc);
         }
 
+        // ---- Opt-in latency probes (capture / encode / push) ----
+        measure_latency_ = p.measure_latency;
+        neg_valid_ = false;   // re-query negotiated caps after (re)build
+        if (measure_latency_) {
+            lat_.reset();
+            CA_LOG_INFO("Latency probe enabled: capture(cam.src) -> encode(enc.src)"
+                        " -> push(parse.src)");
+            auto attach = [&](const char* name, const char* pad, int stage) {
+                GstElement* e = gst_bin_get_by_name(GST_BIN(pipeline_), name);
+                if (!e) { CA_LOG_WARN("latency probe: element '{}' not found", name); return; }
+                GstPad* p2 = gst_element_get_static_pad(e, pad);
+                if (p2) {
+                    lat_ctx_[stage].t = &lat_;
+                    lat_ctx_[stage].stage = stage;
+                    gst_pad_add_probe(p2,
+                        static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER),
+                        &latency_probe_cb, &lat_ctx_[stage], nullptr);
+                    gst_object_unref(p2);
+                }
+                gst_object_unref(e);
+            };
+            // rtspclientsink exposes a *request* sink pad (sink_%u), not a static
+            // "sink", so its push boundary is sampled at h264parse's static src
+            // pad: rtspclientsink (a sink) pulls from h264parse, so the parse.src
+            // probe fires exactly as the encoded frame is taken for pushing.
+            attach("cam",   "src", 0);
+            attach("enc",   "src", 1);
+            attach("parse", "src", 2);
+        }
+
         // ---- Bus watch ----
         // stop() raises stop_flag_ to make the previous bus thread return. It has
         // to be cleared here, otherwise a rebuilt pipeline (reconnect path) would
@@ -162,6 +318,7 @@ public:
             set_status(StreamStatus::ERROR);
             return false;
         }
+        query_negotiated();
         return true;
     }
 
@@ -184,6 +341,12 @@ public:
     bool is_running() const override { return pipeline_ != nullptr && running_; }
 
     StreamStatus get_status() const override { return status_.load(); }
+
+    bool get_negotiated_resolution(int& width, int& height, int& fps) const override {
+        if (!neg_valid_) return false;
+        width = neg_w_; height = neg_h_; fps = neg_fps_;
+        return true;
+    }
 
     void set_status_callback(StatusCallback cb) override { cb_ = std::move(cb); }
 
@@ -208,6 +371,57 @@ private:
     void set_status(StreamStatus s) {
         status_ = s;
         if (cb_) cb_(s);
+    }
+
+    // Read the actually-negotiated capture format and log it. In auto_res mode
+    // this is the camera's native resolution/fps; it also corrects DeviceInfo
+    // reporting when an explicit caps was used.
+    //
+    // The camera SOURCE pad ("cam" src) carries the device's native format and
+    // always has fixed negotiated caps (width/height/framerate). The encoder
+    // sink pad can still report only template caps at PLAYING time, so it is
+    // only used as a fallback.
+    void query_negotiated() {
+        if (!pipeline_) return;
+        auto read_pad = [&](const char* elem, const char* pad) -> bool {
+            GstElement* e = gst_bin_get_by_name(GST_BIN(pipeline_), elem);
+            if (!e) return false;
+            GstPad* p = gst_element_get_static_pad(e, pad);
+            bool ok = false;
+            if (p) {
+                GstCaps* caps = gst_pad_get_current_caps(p);
+                if (!caps) caps = gst_pad_query_caps(p, nullptr);
+                if (caps && gst_caps_get_size(caps) > 0) {
+                    const GstStructure* s = gst_caps_get_structure(caps, 0);
+                    gint w = 0, h = 0;
+                    if (gst_structure_get_int(s, "width", &w) &&
+                        gst_structure_get_int(s, "height", &h)) {
+                        int fps = 0;
+                        const GValue* fr = gst_structure_get_value(s, "framerate");
+                        if (fr && GST_VALUE_HOLDS_FRACTION(fr)) {
+                            const gint den = gst_value_get_fraction_denominator(fr);
+                            const gint num = gst_value_get_fraction_numerator(fr);
+                            if (den > 0) fps = num / den;
+                        }
+                        // Log only when the negotiated format changes (avoids a
+                        // duplicate line from start() and the PLAYING state msg).
+                        if (!neg_valid_ || w != neg_w_ || h != neg_h_ || fps != neg_fps_) {
+                            neg_w_ = w; neg_h_ = h; neg_fps_ = fps; neg_valid_ = true;
+                            CA_LOG_INFO("Negotiated capture format: {}x{} @ {}fps", w, h, fps);
+                        }
+                        ok = true;
+                    } else {
+                        CA_LOG_INFO("Negotiated caps (no w/h): {}", gst_caps_to_string(caps));
+                    }
+                    if (caps) gst_caps_unref(caps);
+                }
+                gst_object_unref(p);
+            }
+            gst_object_unref(e);
+            return ok;
+        };
+        if (read_pad("cam", "src")) return;
+        read_pad("enc", "sink");
     }
 
     static GstPadProbeReturn probe_cb(GstPad*, GstPadProbeInfo* info, gpointer user) {
@@ -235,6 +449,7 @@ private:
             if (!msg) continue;
             handle_message(msg);
             gst_message_unref(msg);
+            if (measure_latency_) lat_.maybe_log();
         }
     }
 
@@ -259,6 +474,7 @@ private:
                     gst_message_parse_state_changed(msg, &old, &cur, &pending);
                     if (cur == GST_STATE_PLAYING) {
                         running_ = true;
+                        query_negotiated();   // caps may finalize only now
                         set_status(StreamStatus::STREAMING);
                     } else if (cur == GST_STATE_NULL) {
                         running_ = false;
@@ -279,6 +495,14 @@ private:
     std::atomic<StreamStatus> status_{StreamStatus::DISCONNECTED};
     StatusCallback cb_;
     std::string   missing_;
+
+    bool         measure_latency_ = false;
+    LatencyTracker lat_;
+    LatencyCbCtx lat_ctx_[3];
+
+    // Negotiated capture format (filled by query_negotiated()).
+    int  neg_w_ = 0, neg_h_ = 0, neg_fps_ = 0;
+    bool neg_valid_ = false;
 
     mutable std::mutex stats_mtx_;
     Statistics    stats_{};

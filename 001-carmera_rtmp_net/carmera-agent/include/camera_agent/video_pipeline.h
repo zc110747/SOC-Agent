@@ -17,6 +17,8 @@ struct PipelineParams {
     int         keyframe_interval = 30;
     std::string encoder = "h264";      // "h264"/"x264" -> x264enc; or a HW encoder element name
     std::string source = "auto";       // real backend only: ksvideosrc | dshowvideosrc | auto
+    bool        measure_latency = false; // opt-in: probe capture/encode/push latency
+    bool        auto_res = false;       // native passthrough: don't force width/height/fps caps
 };
 
 // Abstract video pipeline: capture -> convert -> encode (H264) -> parse -> rtp -> rtspclientsink.
@@ -40,6 +42,13 @@ public:
     virtual Statistics   get_stats() const = 0;
     virtual bool         is_running() const = 0;
     virtual StreamStatus get_status() const = 0;
+
+    // When the pipeline negotiates resolution/fps on its own (auto_res mode),
+    // report the actually-negotiated values. Returns false if not known yet.
+    virtual bool get_negotiated_resolution(int& width, int& height, int& fps) const {
+        (void)width; (void)height; (void)fps;
+        return false;
+    }
 
     // Register a callback invoked on every stream status change.
     virtual void set_status_callback(StatusCallback cb) = 0;

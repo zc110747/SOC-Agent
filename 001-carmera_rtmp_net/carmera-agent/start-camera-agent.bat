@@ -29,8 +29,10 @@ cd /d "%ROOT%"
 
 REM ---- parse args ----
 set NOPAUSE=0
+set LATENCY=
 for %%a in (%*) do (
   if /i "%%a"=="--no-pause" set NOPAUSE=1
+  if /i "%%a"=="--latency-probe" set LATENCY=--latency-probe
 )
 
 REM ---- auto-detect external tools so a double-click works without them on PATH ----
@@ -77,10 +79,17 @@ for /l %%i in (1,1,15) do (
 if "%MT_READY%"=="1" ( echo [OK]    mediamtx ready ) else ( echo [WARN]  mediamtx not ready - see tests\finished\mediamtx.log )
 
 echo [2/3] Starting camera-agent (push stream) ...
-start "camera-agent" cmd /c "%EXE% --camera 0 --width 240 --height 240 --fps 8 --stream camera01 --log-level info > %FINISHED%\agent.log 2>&1"
+start "camera-agent" cmd /c "%EXE% --camera 0 --width 240 --height 240 --fps 8 --stream camera01 %LATENCY% --log-level info > %FINISHED%\agent.log 2>&1"
 
 echo [2/3] Starting ffplay (viewer) ...
-start "ffplay" ffplay -rtsp_transport tcp -fflags nobuffer -flags low_delay rtsp://127.0.0.1:8554/camera01
+REM Low-latency viewer flags:
+REM   -rtsp_transport tcp      force interleaved TCP (matches mediamtx rtspTransport)
+REM   -rtsp_flags nobuffer     disable RTSP demuxer startup buffering (~2s by default)
+REM   -fflags nobuffer         skip input format buffering
+REM   -flags low_delay         decoder low-delay hint
+REM   -probesize/-analyzeduration  minimal stream probing/analysis wait
+REM   -framedrop               drop late frames to stay real-time
+start "ffplay" ffplay -rtsp_transport tcp -rtsp_flags nobuffer -fflags nobuffer -flags low_delay -probesize 32768 -analyzeduration 0 -framedrop rtsp://127.0.0.1:8554/camera01
 
 REM ---- (4) verify camera-agent status ----
 set ST_OK=0

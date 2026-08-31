@@ -97,6 +97,11 @@ int as_int(const YNode* n, int def) {
     if (!n || n->type != YNode::SCALAR) return def;
     return std::atoi(n->scalar.c_str());
 }
+bool as_bool(const YNode* n, bool def) {
+    if (!n || n->type != YNode::SCALAR) return def;
+    const std::string s = n->scalar;
+    return (s == "true" || s == "True" || s == "1" || s == "yes" || s == "YES");
+}
 std::string as_str(const YNode* n, const std::string& def) {
     if (!n || n->type != YNode::SCALAR) return def;
     return n->scalar;
@@ -122,6 +127,7 @@ bool load_config(Config& cfg, const std::string& path) {
         cfg.camera.width  = as_int(find(*cam, "width"), cfg.camera.width);
         cfg.camera.height = as_int(find(*cam, "height"), cfg.camera.height);
         cfg.camera.fps    = as_int(find(*cam, "fps"), cfg.camera.fps);
+        cfg.camera.auto_res = as_bool(find(*cam, "auto"), cfg.camera.auto_res);
     }
     if (auto* enc = find(root, "encoder")) {
         cfg.encoder.codec            = as_str(find(*enc, "codec"), cfg.encoder.codec);

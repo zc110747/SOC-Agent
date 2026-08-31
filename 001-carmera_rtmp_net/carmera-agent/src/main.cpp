@@ -29,14 +29,18 @@ static void print_help() {
         "  --width <px>       Capture width (default 1280)\n"
         "  --height <px>      Capture height (default 720)\n"
         "  --fps <n>          Capture fps (default 30)\n"
+        "  --auto             Auto-negotiate resolution/fps: let the camera use its\n"
+        "                      native format instead of forcing --width/--height/--fps\n"
         "  --bitrate <kbps>   Encoder bitrate (default 4000)\n"
         "  --stream <id>      Stream id (default camera01)\n"
         "  --server <host>    RTSP server host (default 127.0.0.1)\n"
         "  --port <n>         RTSP server port (default 8554)\n"
         "  --device-id <id>   Device id for status reporting\n"
+        "  --source <elem>    Camera source element (auto | mfvideosrc | dshowvideosrc | videotestsrc ...)\n"
         "  --config <path>    YAML config file (default: config/camera-agent.yaml if present)\n"
         "  --duration <sec>   Auto-stop after N seconds (0 = until Ctrl+C)\n"
         "  --log-level <lvl>  trace|debug|info|warn|error (default info)\n"
+        "  --latency-probe    Instrument per-stage latency (capture->encode->push)\n"
         "  --version          Show version\n"
         "  --help             Show this help\n";
 }
@@ -80,12 +84,12 @@ static bool file_exists(const std::string& p) {
 int main(int argc, char** argv) {
     // ---- 1. Parse raw CLI into an overrides structure ----
     struct Cli {
-        bool list=false, version=false, help=false;
+        bool list=false, version=false, help=false, latency=false, autoneg=false;
         bool camera=false, width=false, height=false, fps=false, bitrate=false;
-        bool stream=false, server=false, port=false, device=false, log=false, dur=false;
+        bool stream=false, server=false, port=false, device=false, log=false, dur=false, source=false;
         int  camera_v=0, width_v=0, height_v=0, fps_v=0, bitrate_v=0, port_v=0;
         double duration_v=0;
-        std::string stream_v, server_v, device_v, log_v, config;
+        std::string stream_v, server_v, device_v, log_v, config, source_v;
     } cli;
 
     auto get_val = [&](int i, const char* opt) -> std::string {
@@ -108,6 +112,9 @@ int main(int argc, char** argv) {
         else if (a == "--server")     { cli.server = true;  cli.server_v = get_val(i++, "--server"); }
         else if (a == "--port")       { cli.port = true;    cli.port_v = std::atoi(get_val(i++, "--port").c_str()); }
         else if (a == "--device-id")  { cli.device = true;  cli.device_v = get_val(i++, "--device-id"); }
+        else if (a == "--latency-probe") cli.latency = true;
+        else if (a == "--auto")         cli.autoneg = true;
+        else if (a == "--source")     { cli.source = true;   cli.source_v = get_val(i++, "--source"); }
         else if (a == "--config")     { cli.config = get_val(i++, "--config"); }
         else if (a == "--duration")   { cli.dur = true;     cli.duration_v = std::atof(get_val(i++, "--duration").c_str()); }
     }
@@ -125,12 +132,15 @@ int main(int argc, char** argv) {
     if (cli.width)  cfg.camera.width    = cli.width_v;
     if (cli.height) cfg.camera.height   = cli.height_v;
     if (cli.fps)    cfg.camera.fps      = cli.fps_v;
+    if (cli.autoneg)   cfg.camera.auto_res = true;
     if (cli.bitrate) cfg.encoder.bitrate = cli.bitrate_v;
     if (cli.stream) cfg.stream.id       = cli.stream_v;
     if (cli.server) cfg.rtsp.server     = cli.server_v;
     if (cli.port)   cfg.rtsp.port       = cli.port_v;
     if (cli.device) cfg.device_id       = cli.device_v;
     if (cli.log)    cfg.log_level       = cli.log_v;
+    if (cli.latency) cfg.measure_latency = true;
+    if (cli.source)  cfg.source          = cli.source_v;
     const double duration = cli.dur ? cli.duration_v : 0.0;
 
     ca::log::set_level(cfg.log_level);

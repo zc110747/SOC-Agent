@@ -39,11 +39,12 @@ type PathsListResponse struct {
 
 // Manager controls the MediaMTX lifecycle.
 type Manager struct {
-	cfg        *config.Config
-	cmd        *exec.Cmd
-	apiBase    string
-	webrtcBase string
-	httpClient *http.Client
+	cfg            *config.Config
+	cmd            *exec.Cmd
+	generatedPath  string
+	apiBase        string
+	webrtcBase     string
+	httpClient     *http.Client
 }
 
 func New(cfg *config.Config) *Manager {
@@ -70,7 +71,10 @@ func resolveBinary(p string) string {
 }
 
 // GenerateConfig writes the MediaMTX YAML derived from our Config so that ports
-// stay the single source of truth. It is regenerated on every start.
+// stay the single source of truth. It is regenerated on every start. The file is
+// written to a unique temp name inside the configured config directory so that
+// (a) it never clobbers a checked-in config file and (b) repeated starts never
+// try to overwrite a pre-existing file (which some sandboxes forbid).
 func (m *Manager) GenerateConfig() error {
 	body := fmt.Sprintf(`logLevel: info
 api: true
@@ -89,12 +93,23 @@ paths:
     source: publisher
 `, m.cfg.MediaMTX.APIPort, m.cfg.RTSP.Port, m.cfg.WebRTC.Port, m.cfg.MediaMTX.HLSPort)
 
-	if err := os.MkdirAll(dirOf(m.cfg.MediaMTX.Config), 0o755); err != nil {
+	dir := dirOf(m.cfg.MediaMTX.Config)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create config dir: %w", err)
 	}
-	if err := os.WriteFile(m.cfg.MediaMTX.Config, []byte(body), 0o644); err != nil {
+	f, err := os.CreateTemp(dir, "mediamtx-*.yml")
+	if err != nil {
 		return fmt.Errorf("write mediamtx config: %w", err)
 	}
+	if _, err := f.WriteString(body); err != nil {
+		f.Close()
+		return fmt.Errorf("write mediamtx config: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("write mediamtx config: %w", err)
+	}
+	m.generatedPath = f.Name()
+	logger.Debug("mediamtx config written to %s", m.generatedPath)
 	return nil
 }
 
@@ -107,7 +122,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	if _, err := os.Stat(binary); err != nil {
 		return fmt.Errorf("mediamtx binary not found at %q (set mediamtx.binary in config)", binary)
 	}
-	cmd := exec.Command(binary, m.cfg.MediaMTX.Config)
+	cmd := exec.Command(binary, m.generatedPath)
 	cmd.Stdout = &logWriter{}
 	cmd.Stderr = &logWriter{}
 	if err := cmd.Start(); err != nil {
@@ -130,6 +145,10 @@ func (m *Manager) Stop() {
 	_ = m.cmd.Process.Kill()
 	_, _ = m.cmd.Process.Wait()
 	m.cmd = nil
+	if m.generatedPath != "" {
+		_ = os.Remove(m.generatedPath)
+		m.generatedPath = ""
+	}
 	logger.Info("mediamtx stopped")
 }
 

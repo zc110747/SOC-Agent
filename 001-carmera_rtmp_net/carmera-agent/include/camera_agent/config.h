@@ -9,6 +9,7 @@ struct CameraConfig {
     int         width = 1280;
     int         height = 720;
     int         fps = 30;
+    bool        auto_res = false;   // true: don't force caps, let camera negotiate native format
 };
 
 struct EncoderConfig {
@@ -32,7 +33,9 @@ struct Config {
     StreamConfig  stream;
     RtspConfig    rtsp;
     std::string   device_id = "camera01";
+    std::string   source = "auto";     // camera source element; "auto" or a GStreamer src name (e.g. videotestsrc for testing)
     std::string   log_level = "info";
+    bool        measure_latency = false; // --latency-probe: instrument per-stage latency
 };
 
 // Build the default configuration (matches camera-agent.yaml defaults).

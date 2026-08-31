@@ -4,7 +4,7 @@
 server:
   # Public host used to build RTSP / WebRTC URLs shown in the UI and API.
   host: localhost
-  http_port: 8080
+  http_port: 8090
 
 rtsp:
   port: 8554
@@ -27,7 +27,7 @@ mediamtx:
   # (runtime state) rather than config/ (source).
   config: ./data/mediamtx.yml
   # MediaMTX control API port (used for camera auto-discovery).
-  api_port: 9997
+  api_port: 9998
   # HLS port (optional; exposed for completeness).
   hls_port: 8888
 
