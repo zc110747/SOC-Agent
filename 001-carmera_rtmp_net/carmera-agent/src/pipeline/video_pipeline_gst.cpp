@@ -1,6 +1,11 @@
 // Real video pipeline backed by GStreamer 1.0.
 // capture -> videoconvert -> (caps) -> H264 encoder -> h264parse ->
-// rtph264pay -> rtspclientsink(location).
+// rtspclientsink(location).
+//
+// Note: rtspclientsink exposes a *request* pad (sink_%u) and selects its own
+// RTP payloader internally (pad property "payloader"). Feeding it the output of
+// an explicit rtph264pay fails to link ("could not link pay0 to rtspclientsink0"),
+// so the encoded stream goes straight from h264parse into rtspclientsink.
 // Compiled only when CAMERA_AGENT_BACKEND == gstreamer.
 #include "camera_agent/video_pipeline.h"
 #include "camera_agent/logger.h"
@@ -26,7 +31,7 @@ bool element_available(const char* element) {
 
 // Map the configured encoder name to a GStreamer element + options.
 std::string encoder_element(const std::string& enc, int bitrate, int keyint) {
-    if (enc == "h264" || enc == "x264") {
+    if (enc == "h264" || enc == "x264" || enc == "x264enc") {
         return "x264enc name=enc bitrate=" + std::to_string(bitrate) +
                " key-int-max=" + std::to_string(keyint) +
                " tune=zerolatency speed-preset=veryfast";
@@ -35,11 +40,26 @@ std::string encoder_element(const std::string& enc, int bitrate, int keyint) {
     return enc + " name=enc bitrate=" + std::to_string(bitrate);
 }
 
-std::string source_element(const std::string& src, int device_index) {
-    std::string name = (src == "ksvideosrc" || src == "ks") ? "ksvideosrc"
-                     : (src == "dshowvideosrc" || src == "dshow") ? "dshowvideosrc"
-                     : "dshowvideosrc"; // "auto" -> dshowvideosrc (widely available on Windows)
-    return name + " device-index=" + std::to_string(device_index);
+// Pick the best Windows camera source. On this machine gst-device-monitor
+// reports the UVC device under Media Foundation (mfvideosrc); dshowvideosrc and
+// ksvideosrc leave the pipeline stalled after the first frame for such devices,
+// so Media Foundation is preferred when available.
+std::string pick_source() {
+    const char* sw[] = {"mfvideosrc", "dshowvideosrc", "ksvideosrc", nullptr};
+    for (const char** s = sw; *s; ++s) {
+        if (element_available(*s)) return *s;
+    }
+    return "";
+}
+
+std::string source_element(const std::string& src) {
+    std::string name;
+    if (src == "ksvideosrc" || src == "ks")            name = "ksvideosrc";
+    else if (src == "dshowvideosrc" || src == "dshow") name = "dshowvideosrc";
+    else if (src == "mfvideosrc" || src == "mf")       name = "mfvideosrc";
+    else                                                name = pick_source(); // "auto" / unknown
+    if (name.empty()) name = "dshowvideosrc"; // last resort; required-check reports missing
+    return name;
 }
 
 // Prefer a hardware H264 encoder; fall back to x264enc.
@@ -68,15 +88,13 @@ public:
 
     bool build(const PipelineParams& p, const std::string& rtsp_url) override {
         // ---- Required element checks (clear error, no crash) ----
-        const std::string src = (p.source == "ksvideosrc" || p.source == "ks") ? "ksvideosrc"
-                              : (p.source == "dshowvideosrc" || p.source == "dshow") ? "dshowvideosrc"
-                              : "dshowvideosrc";
+        const std::string src = source_element(p.source);
         const std::string enc_elem = (p.encoder == "h264" || p.encoder == "x264")
                                      ? pick_encoder() : p.encoder;
 
         const char* required[] = {
             src.c_str(), "videoconvert", enc_elem.c_str(),
-            "h264parse", "rtph264pay", "rtspclientsink"
+            "h264parse", "rtspclientsink"
         };
         for (const char* e : required) {
             if (!element_available(e)) {
@@ -87,15 +105,18 @@ public:
         }
 
         // ---- Build the pipeline description ----
+        // The caps filter deliberately leaves `format` unconstrained: hardware
+        // encoders such as nvh264enc accept NV12/Y444/... but NOT I420, so
+        // pinning I420 here makes every HW encoder fail to link. Without it,
+        // videoconvert negotiates whatever the chosen encoder supports.
         const std::string desc =
-            source_element(p.source, p.camera_id) +
+            src + " device-index=" + std::to_string(p.camera_id) +
             " ! videoconvert" +
-            " ! video/x-raw,format=I420,width=" + std::to_string(p.width) +
+            " ! video/x-raw,width=" + std::to_string(p.width) +
             ",height=" + std::to_string(p.height) +
             ",framerate=" + std::to_string(p.fps) + "/1" +
-            " ! " + encoder_element(p.encoder, p.bitrate, p.keyframe_interval) +
+            " ! " + encoder_element(enc_elem, p.bitrate, p.keyframe_interval) +
             " ! h264parse" +
-            " ! rtph264pay name=pay0 pt=96 config-interval=1" +
             " ! rtspclientsink location=" + rtsp_url;
 
         CA_LOG_INFO("Pipeline: {}", desc);
@@ -122,6 +143,10 @@ public:
         }
 
         // ---- Bus watch ----
+        // stop() raises stop_flag_ to make the previous bus thread return. It has
+        // to be cleared here, otherwise a rebuilt pipeline (reconnect path) would
+        // spawn a watcher that exits immediately and never reports STREAMING.
+        stop_flag_ = false;
         bus_ = gst_element_get_bus(pipeline_);
         bus_thread_ = std::thread(&GstVideoPipeline::bus_loop, this);
         return true;
@@ -163,12 +188,14 @@ public:
     void set_status_callback(StatusCallback cb) override { cb_ = std::move(cb); }
 
     bool check_plugins(std::vector<std::string>* missing) override {
-        // A camera source (either) is required.
-        if (!element_available("dshowvideosrc") && !element_available("ksvideosrc")) {
-            if (missing) missing->push_back("ksvideosrc or dshowvideosrc (camera source)");
+        // A camera source (any Windows backend) is required.
+        if (!element_available("mfvideosrc") && !element_available("dshowvideosrc") &&
+            !element_available("ksvideosrc")) {
+            if (missing) missing->push_back("mfvideosrc / ksvideosrc / dshowvideosrc (camera source)");
         }
+        // rtspclientsink does its own RTP payloading, so no rtppay element here.
         const char* base[] = {"videoconvert", "x264enc",
-                              "h264parse", "rtph264pay", "rtspclientsink"};
+                              "h264parse", "rtspclientsink"};
         for (const char* e : base) {
             if (!element_available(e)) {
                 if (missing) missing->push_back(e);
@@ -187,7 +214,7 @@ private:
         auto* self = static_cast<GstVideoPipeline*>(user);
         GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
         if (buf) {
-            const guint sz = gst_buffer_get_size(buf);
+            const gsize sz = gst_buffer_get_size(buf);
             std::lock_guard<std::mutex> lk(self->stats_mtx_);
             self->stats_.frames += 1;
             self->bytes_since_sample_ += sz;

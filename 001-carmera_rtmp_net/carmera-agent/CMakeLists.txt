@@ -25,9 +25,29 @@ FetchContent_MakeAvailable(spdlog)
 # ---- GStreamer detection (only needed for the real backend) -----------------
 # On MSVC we locate the official GStreamer "devel" package directly (no
 # pkg-config required). On other toolchains (MinGW) we use pkg-config.
+#
+# GSTREAMER_ROOT auto-detects among common install locations so a plain
+# `cmake -S .` works out of the box; override with -DGSTREAMER_ROOT=... if
+# your install lives elsewhere.
 set(HAVE_GSTREAMER OFF)
-set(GSTREAMER_ROOT "C:/gstreamer/1.0/msvc_x86_64" CACHE PATH
-    "GStreamer 1.0 install root (official MSVC devel package)")
+
+set(_gst_candidates
+  "$ENV{GSTREAMER_ROOT}"
+  "C:/Program Files/gstreamer/1.0/msvc_x86_64"
+  "C:/gstreamer/1.0/msvc_x86_64"
+  "D:/Software/gstreamer/1.0/msvc_x86_64")
+set(GSTREAMER_ROOT "" CACHE PATH "GStreamer 1.0 install root (official MSVC devel package)")
+if(NOT GSTREAMER_ROOT)
+  foreach(_c ${_gst_candidates})
+    if(_c AND IS_DIRECTORY "${_c}")
+      set(GSTREAMER_ROOT "${_c}")
+      break()
+    endif()
+  endforeach()
+endif()
+if(NOT GSTREAMER_ROOT)
+  set(GSTREAMER_ROOT "C:/Program Files/gstreamer/1.0/msvc_x86_64")
+endif()
 
 if(CAMERA_AGENT_BACKEND STREQUAL "gstreamer" OR CAMERA_AGENT_BACKEND STREQUAL "auto")
   if(MSVC)
@@ -84,6 +104,7 @@ if(CAMERA_AGENT_BACKEND STREQUAL "auto")
 endif()
 
 message(STATUS "Camera-Agent backend selected: ${CAMERA_AGENT_BACKEND}")
+message(STATUS "GStreamer root: ${GSTREAMER_ROOT}")
 
 add_subdirectory(src)
 

@@ -1,0 +1,7 @@
+# Minimal MediaMTX config for the Camera Agent demo.
+# MediaMTX auto-loads this file when launched from the project root.
+# "all_others" with no source lets the agent publish to any RTSP path
+# (e.g. rtsp://127.0.0.1:8554/camera01) without per-path setup.
+logLevel: info
+paths:
+  all_others:

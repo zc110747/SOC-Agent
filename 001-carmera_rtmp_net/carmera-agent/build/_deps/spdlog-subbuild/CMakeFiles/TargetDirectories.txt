@@ -1,3 +1,0 @@
-E:/cnb/git/SOC-Agent/001-carmera_rtmp_net/carmera-agent/build/_deps/spdlog-subbuild/CMakeFiles/spdlog-populate.dir
-E:/cnb/git/SOC-Agent/001-carmera_rtmp_net/carmera-agent/build/_deps/spdlog-subbuild/CMakeFiles/edit_cache.dir
-E:/cnb/git/SOC-Agent/001-carmera_rtmp_net/carmera-agent/build/_deps/spdlog-subbuild/CMakeFiles/rebuild_cache.dir

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <thread>
@@ -69,6 +70,16 @@ private:
     std::thread                   reconnect_thread_;
     std::atomic<bool>             reconnecting_{false};
     int                           attempt_ = 0;
+
+    // A STREAMING report right after PLAYING is not proof the RTSP server is
+    // actually reachable (rtspclientsink connects asynchronously and the
+    // pipeline flips to PLAYING before the handshake completes). We only reset
+    // the backoff/attempt counter once STREAMING has been stable for this many
+    // seconds, so a brief false-STREAMING during a server outage does not wipe
+    // the escalating 1/2/5/10s backoff.
+    static constexpr double kStableGraceSec = 3.0;
+    std::chrono::steady_clock::time_point last_disconnect_ =
+        std::chrono::steady_clock::now();
 };
 
 } // namespace ca

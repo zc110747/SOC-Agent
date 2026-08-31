@@ -137,14 +137,22 @@ void StreamController::on_status(StreamStatus s) {
     status_ = s;
     if (s == StreamStatus::STREAMING) {
         if (attempt_ > 0) {
-            CA_LOG_INFO("Status: STREAMING -> {} (reconnected after {} attempt(s))",
-                        rtsp_url_, attempt_);
-            attempt_ = 0;
-            backoff_.reset();
+            // Only treat the reconnect as truly successful after STREAMING has
+            // stayed up for the grace period; otherwise a pipeline that flips
+            // to PLAYING but fails the RTSP handshake would reset the backoff.
+            const double dt = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - last_disconnect_).count();
+            if (dt >= kStableGraceSec) {
+                CA_LOG_INFO("Status: STREAMING -> {} (reconnected after {} attempt(s))",
+                            rtsp_url_, attempt_);
+                attempt_ = 0;
+                backoff_.reset();
+            }
         } else {
             CA_LOG_INFO("Status: STREAMING -> {}", rtsp_url_);
         }
     } else if (s == StreamStatus::DISCONNECTED) {
+        last_disconnect_ = std::chrono::steady_clock::now();
         CA_LOG_WARN("Status: DISCONNECTED");
     } else if (s == StreamStatus::ERROR) {
         CA_LOG_ERROR("Status: ERROR");

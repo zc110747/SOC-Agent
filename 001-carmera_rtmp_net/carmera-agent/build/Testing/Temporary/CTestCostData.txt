@@ -1,2 +1,0 @@
-camera-agent-tests 1 0.877873
----

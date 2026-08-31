@@ -24,7 +24,8 @@ target_include_directories(camera-agent PRIVATE
   ${PROJECT_SOURCE_DIR}/include)
 
 if(MSVC)
-  target_compile_options(camera-agent PRIVATE /W4 /EHsc)
+  # /utf-8: sources are UTF-8; without it MSVC reads them as GBK and emits C4819.
+  target_compile_options(camera-agent PRIVATE /W4 /EHsc /utf-8)
 else()
   target_compile_options(camera-agent PRIVATE -Wall -Wextra)
 endif()
