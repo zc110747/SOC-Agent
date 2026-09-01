@@ -185,6 +185,11 @@ func (h *Handler) cameraStream(w http.ResponseWriter, r *http.Request) {
 			"signaling": "/api/cameras/" + c.ID + "/webrtc",
 			"path":      c.StreamPath,
 		},
+		// Same-origin fallback for phones: plain HTTP/TCP, so it survives
+		// blocked UDP/ICE and WebKit's refusal to run WebRTC on http.
+		"hls_url": HLSURL(h.cfg, c.StreamPath),
+		// Direct MediaMTX port, handy for debugging with an external player.
+		"hls_direct_url": HLSPlaylistAddr(h.cfg, c.StreamPath),
 	})
 }
 

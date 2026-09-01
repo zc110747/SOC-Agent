@@ -69,6 +69,12 @@ type MediaMTXConfig struct {
 	// instance would otherwise collide on the 8000/8001 defaults).
 	RTPPort  int `yaml:"rtp_port"`
 	RTCPPort int `yaml:"rtcp_port"`
+	// ICEUDPPort / ICETCPPort are the WebRTC ICE listeners. TCP is enabled
+	// alongside UDP on purpose: it is the only way WebRTC survives a network
+	// that blocks UDP between wireless clients, which is the usual reason a
+	// phone shows no picture while a desktop player is fine.
+	ICEUDPPort int `yaml:"ice_udp_port"`
+	ICETCPPort int `yaml:"ice_tcp_port"`
 }
 
 type LogConfig struct {
@@ -84,7 +90,11 @@ func Default() *Config {
 		RTSP:     RTSPConfig{Port: 8554},
 		WebRTC:   WebRTCConfig{Port: 8889},
 		Database: DatabaseConfig{Path: "data/video.db"},
-		MediaMTX: MediaMTXConfig{Binary: "./mediamtx/mediamtx", Config: "./config/mediamtx.yml", Bind: "0.0.0.0", APIBind: "127.0.0.1", APIPort: 9997, HLSPort: 8888, RTPPort: 8000, RTCPPort: 8001},
+		MediaMTX: MediaMTXConfig{
+			Binary: "./mediamtx/mediamtx", Config: "./config/mediamtx.yml",
+			Bind: "0.0.0.0", APIBind: "127.0.0.1", APIPort: 9997, HLSPort: 8888,
+			RTPPort: 8000, RTCPPort: 8001, ICEUDPPort: 8189, ICETCPPort: 8189,
+		},
 		Log:      LogConfig{Level: "info"},
 	}
 }
@@ -156,6 +166,12 @@ func applyDefaults(cfg *Config) {
 	if cfg.MediaMTX.RTCPPort == 0 {
 		cfg.MediaMTX.RTCPPort = 8001
 	}
+	if cfg.MediaMTX.ICEUDPPort == 0 {
+		cfg.MediaMTX.ICEUDPPort = 8189
+	}
+	if cfg.MediaMTX.ICETCPPort == 0 {
+		cfg.MediaMTX.ICETCPPort = 8189
+	}
 	if cfg.Log.Level == "" {
 		cfg.Log.Level = "info"
 	}
@@ -196,6 +212,17 @@ func (c *Config) MediaListenAddr(port int) string {
 // APIListenAddr builds the MediaMTX control API listen address.
 func (c *Config) APIListenAddr() string {
 	return net.JoinHostPort(c.MediaMTX.APIBind, strconv.Itoa(c.MediaMTX.APIPort))
+}
+
+// HLSUpstreamAddr is the address THIS server dials to reach MediaMTX's HLS
+// endpoint when proxying /hls/*. With the default wildcard bind that is
+// loopback; if MediaMTX was pinned to a single interface we dial that one.
+func (c *Config) HLSUpstreamAddr() string {
+	host := "127.0.0.1"
+	if !netiface.IsWildcard(c.MediaMTX.Bind) && !netiface.IsLoopbackBind(c.MediaMTX.Bind) {
+		host = c.MediaMTX.Bind
+	}
+	return net.JoinHostPort(host, strconv.Itoa(c.MediaMTX.HLSPort))
 }
 
 // RTSPURL builds the public RTSP URL for a stream path, using the advertised

@@ -129,6 +129,16 @@ func (m *Manager) GenerateConfig() error {
 	// players anywhere on the LAN can push/pull. The control API is a separate
 	// bind address and defaults to loopback - only this server uses it, so
 	// there is no reason to hand full stream control to the whole network.
+	// Notes on the non-obvious entries:
+	//  - rtmp/srt/moq are turned OFF. This project ingests RTSP and serves
+	//    RTSP/WebRTC/HLS only; leaving the others on opens three more listening
+	//    sockets per start and makes a second instance impossible.
+	//  - webrtcLocalTCPAddress enables ICE over TCP. Without it WebRTC can only
+	//    use UDP, which is precisely what phones on Wi-Fi (or behind routers
+	//    that filter client-to-client UDP) often cannot get through - the
+	//    classic "fine on the desktop, black rectangle on the phone" symptom.
+	//  - webrtcIPsFromInterfaces turns every local interface IP into an ICE
+	//    candidate, so a phone can pick the one it can actually route to.
 	body := fmt.Sprintf(`logLevel: info
 api: true
 apiAddress: %s
@@ -136,8 +146,14 @@ rtsp: true
 rtspAddress: %s
 rtpAddress: :%d
 rtcpAddress: :%d
+rtmp: false
+srt: false
+moq: false
 webrtc: true
 webrtcAddress: %s
+webrtcLocalUDPAddress: :%d
+webrtcLocalTCPAddress: :%d
+webrtcIPsFromInterfaces: true
 hls: true
 hlsAddress: %s
 playback: false
@@ -151,6 +167,8 @@ paths:
 		m.cfg.MediaMTX.RTPPort,
 		m.cfg.MediaMTX.RTCPPort,
 		m.cfg.MediaListenAddr(m.cfg.WebRTC.Port),
+		m.cfg.MediaMTX.ICEUDPPort,
+		m.cfg.MediaMTX.ICETCPPort,
 		m.cfg.MediaListenAddr(m.cfg.MediaMTX.HLSPort),
 	)
 

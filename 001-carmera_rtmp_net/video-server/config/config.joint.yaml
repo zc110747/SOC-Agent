@@ -53,6 +53,11 @@ mediamtx:
   # Control API stays loopback-only: only this server polls it. Exposing it
   # would give the whole LAN full control over every stream.
   api_bind: 127.0.0.1
+  # WebRTC ICE listeners. TCP is enabled next to UDP on purpose: without it a
+  # phone whose UDP path to this box is blocked gets no ICE candidate pair at
+  # all, which looks like "the page loads but the video never starts".
+  ice_udp_port: 8189
+  ice_tcp_port: 8189
   # MediaMTX control API port - the server's monitor polls this to discover
   # cameras. This is the reason the joint run must NOT start a second
   # MediaMTX: only this instance exposes the API.

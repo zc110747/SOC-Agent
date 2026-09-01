@@ -34,6 +34,10 @@ export interface StreamInfo {
     signaling: string
     path: string
   }
+  /** Same-origin HLS playlist, proxied by the server (fallback for phones). */
+  hls_url?: string
+  /** Direct MediaMTX HLS URL, for debugging with an external player. */
+  hls_direct_url?: string
 }
 
 const BASE = '/api'

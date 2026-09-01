@@ -51,10 +51,15 @@ REM randomly fail to bind. Override with: set VS_CONFIG=config.yaml
 set CFG_NAME=config.joint.yaml
 if defined VS_CONFIG set CFG_NAME=%VS_CONFIG%
 set CFG=%ROOT%\config\%CFG_NAME%
-REM Prefer the canonical binary; fall back to the alternate name build.bat
-REM produces when video-server.exe is locked by a still-running instance.
-set VS_EXE=%ROOT%\video-server.exe
-if not exist "%VS_EXE%" if exist "%ROOT%\video-server.new.exe" set VS_EXE=%ROOT%\video-server.new.exe
+REM Pick the NEWEST video-server*.exe: build.bat writes video-server.new.exe
+REM when the canonical name is locked by a running instance, and running a
+REM stale binary is the last thing you want while debugging playback.
+set "VS_NAME="
+for /f "delims=" %%i in ('dir /b /o-d "%ROOT%\video-server*.exe" 2^>nul') do (
+  if not defined VS_NAME set "VS_NAME=%%i"
+)
+if not defined VS_NAME set "VS_NAME=video-server.exe"
+set VS_EXE=%ROOT%\%VS_NAME%
 set CA_EXE=%AGENT_DIR%\build-msvc\src\camera-agent.exe
 
 echo ============================================================

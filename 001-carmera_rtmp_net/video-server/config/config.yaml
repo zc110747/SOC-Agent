@@ -39,9 +39,14 @@ mediamtx:
   # server polls it, and exposing it would hand the whole LAN full control over
   # every stream. Change to 0.0.0.0 only if you know why you need it.
   api_bind: 127.0.0.1
+  # WebRTC ICE listeners (UDP + TCP). TCP matters for phones: it keeps WebRTC
+  # working when UDP between the phone and this box is blocked.
+  ice_udp_port: 8189
+  ice_tcp_port: 8189
   # MediaMTX control API port (used for camera auto-discovery).
   api_port: 9997
-  # HLS port (optional; exposed for completeness).
+  # HLS port. The server also proxies it at /hls/<stream>/index.m3u8 so the web
+  # UI can fall back to HLS on the same origin (and the same firewall rule).
   hls_port: 8888
 
 log:

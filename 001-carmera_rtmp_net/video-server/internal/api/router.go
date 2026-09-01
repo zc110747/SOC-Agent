@@ -16,4 +16,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/cameras/{id}/status", h.cameraStatus)
 	mux.HandleFunc("GET /api/cameras/{id}/stream", h.cameraStream)
 	mux.HandleFunc("POST /api/cameras/{id}/webrtc", h.cameraWebRTC)
+	// Same-origin HLS fallback (see hls.go for why it is proxied rather than
+	// letting the browser hit MediaMTX's HLS port directly).
+	mux.HandleFunc("GET /hls/{stream}", h.hlsProxy)
+	mux.HandleFunc("GET /hls/{stream}/{file...}", h.hlsProxy)
 }

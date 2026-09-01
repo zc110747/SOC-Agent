@@ -215,10 +215,46 @@ curl http://<任意本机IP>:8081/api/net/addresses
 |---|---|---|
 | 浏览器 `ERR_CONNECTION_TIMED_OUT` | Windows 防火墙拦掉入站（最常见） | 管理员运行 `scripts\firewall-add.bat`（或显式给端口：`scripts\firewall-add.bat 8081 8554 8889 8888`） |
 | `ERR_CONNECTION_REFUSED` | 服务没起来 / 端口被占 | 看日志里的 `HTTP listen` 行；换 `server.http_port` |
-| 打得开页面但播放失败 | 媒体的 UDP 侧被拦 | 放行 `mediamtx.exe` 程序规则（`firewall-add.bat` 已加）；或用 RTSP-TCP 传输 |
+| 打得开页面但播放失败 | 媒体的 UDP 侧被拦 | 放行 `mediamtx.exe` 程序规则（`firewall-add.bat` 已加）；或改用下面的 HLS 兜底 |
 | 地址不对（192.168 之外） | 选到了虚拟网卡 | 显式写 `server.host: 192.168.x.x` |
+| **网页能开、列表正常，但手机上没有画面** | WebRTC 在手机侧失败（详见 6.2） | 详见 6.2；播放器会自动降级到 HLS |
 
 撤销放行规则：`scripts\firewall-remove.bat`。
+
+### 6.2 手机能开页面但播不出画面（WebRTC 在手机上失败）
+
+桌面正常、手机黑屏是 WebRTC 的经典症状，与局域网绑定无关。根因按概率排列：
+
+1. **UDP 不通，而 MediaMTX 默认只开 UDP 做 ICE。**
+   MediaMTX 的 `webrtcLocalTCPAddress` 默认为空 —— WebRTC 只能走 UDP。手机走 Wi-Fi 时，
+   路由器/AP 常对无线客户端之间的 UDP 做限制，于是一个候选对都建不起来。
+   **本项目已默认同时开启 TCP/ICE**（`mediamtx.ice_udp_port` / `ice_tcp_port`，默认均 `8189`），
+   启动日志里应看到两行 ICE：
+   ```
+   [WebRTC] started with listeners on 0.0.0.0:8889 (TCP/HTTP), :8189 (UDP/ICE), :8189 (TCP/ICE)
+   ```
+2. **移动端 WebKit 在 http（非安全上下文）下拒绝 WebRTC。**
+   iOS 上所有浏览器都是 WebKit 内核，所以 iPhone 的 Chrome 与 Safari 表现一致 —— 这正是
+   "两个浏览器都不行"的原因。此时 WebRTC 救不回来，只能走下面的 HLS 兜底（或给服务套 HTTPS）。
+3. **自动播放被拦截**（低电量/省流模式）：播放器会显示 `TAP TO PLAY`，点一下即可。
+
+**兜底通道：HLS（同源 + 纯 HTTP/TCP）**
+
+服务端把 MediaMTX 的 HLS 代理到 `/hls/<stream>/index.m3u8`，前端在 WebRTC 7 秒内未出画
+或 ICE 失败时自动切换过去：
+
+- 同源：无 CORS、无混合内容，手机只需要开放 HTTP 这一个端口；
+- 纯 TCP：绕开 UDP 限制，也绕开 http 下 WebRTC 被拒的问题；
+- iOS Safari 原生支持 HLS，Android Chrome 由 hls.js 播放；
+- 代价是延迟从亚秒升到 2~6 秒，所以它只是兜底，不是首选。
+
+播放器右上角可手动在 `WebRTC` / `HLS` 之间切换；左上角显示当前实际通道
+（`WEBRTC` 或 `HLS (fallback)`），下方一行显示失败原因 —— 手机端直接可见，不必开 devtools。
+
+手工验证 HLS 链路（不经过浏览器）：
+```bash
+curl http://<server-ip>:8081/hls/camera01/index.m3u8
+```
 
 > 安全提示：MediaMTX 的**控制 API**（默认 `api_bind: 127.0.0.1:9997`）只对内监听 —— 它没有任何鉴权，暴露到局域网等于把每一路流的控制权交出去。媒体端口（RTSP/WebRTC/HLS）同理无鉴权，只在可信网络内开放。
 
@@ -404,8 +440,9 @@ scripts\test-stream.bat camera01
 | `PUT /api/cameras/{id}` | 更新 |
 | `DELETE /api/cameras/{id}` | 删除 |
 | `GET /api/cameras/{id}/status` | 仅状态 `{"id","status"}` |
-| `GET /api/cameras/{id}/stream` | 播放元数据（rtsp_url、分辨率、fps、bitrate、webrtc.signaling） |
+| `GET /api/cameras/{id}/stream` | 播放元数据（rtsp_url、分辨率、fps、bitrate、webrtc.signaling、hls_url） |
 | `POST /api/cameras/{id}/webrtc` | 转发 SDP offer 到 MediaMTX WHEP，返回 answer |
+| `GET /hls/{stream}/index.m3u8` | 同源 HLS 代理（转发到 MediaMTX 的 `hls_port`），手机端兜底播放用 |
 
 摄像头自动注册由 monitor 驱动：RTSP 推流者连上 MediaMTX 后，`all_others.source: publisher` 会自动创建路径，monitor 检测到 `HasSource` 即按 `stream_path` upsert 为摄像头（`online`/`offline` 由 `Ready` 决定；10s 无数据置 `offline`）。
 
