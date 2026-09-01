@@ -6,11 +6,15 @@ package api
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
+	"strconv"
 
 	"video-server/internal/camera"
 	"video-server/internal/config"
 	"video-server/internal/mediamtx"
+	"video-server/internal/netiface"
 )
 
 // Handler holds the dependencies shared by all API endpoints.
@@ -181,6 +185,41 @@ func (h *Handler) cameraStream(w http.ResponseWriter, r *http.Request) {
 			"signaling": "/api/cameras/" + c.ID + "/webrtc",
 			"path":      c.StreamPath,
 		},
+	})
+}
+
+// networkAddresses godoc: GET /api/net/addresses
+// Reports how the server is bound and every URL a client can use to reach it.
+// The UI (and anyone debugging LAN access) can call this instead of guessing
+// which of the machine's addresses is the right one.
+func (h *Handler) networkAddresses(w http.ResponseWriter, r *http.Request) {
+	addrs := netiface.Enumerate()
+	if addrs == nil {
+		addrs = []netiface.Address{}
+	}
+	urls := make([]string, 0, len(addrs))
+	wildcard := netiface.IsWildcard(h.cfg.Server.Bind)
+	for _, a := range addrs {
+		if netiface.IsLoopbackBind(h.cfg.Server.Bind) && !a.Loopback {
+			continue
+		}
+		if !wildcard && a.IP != h.cfg.Server.Bind {
+			continue
+		}
+		urls = append(urls, fmt.Sprintf("http://%s/", net.JoinHostPort(a.IP, strconv.Itoa(h.cfg.Server.HTTPPort))))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"bind":         h.cfg.Server.Bind,
+		"http_port":    h.cfg.Server.HTTPPort,
+		"public_host":  h.cfg.PublicHost(),
+		"rtsp_url":     h.cfg.RTSPURL("<stream-path>"),
+		"media_bind":   h.cfg.MediaMTX.Bind,
+		"rtsp_port":    h.cfg.RTSP.Port,
+		"webrtc_port":  h.cfg.WebRTC.Port,
+		"hls_port":     h.cfg.MediaMTX.HLSPort,
+		"api_listen":   h.cfg.APIListenAddr(),
+		"addresses":    addrs,
+		"web_ui_urls":  urls,
 	})
 }
 

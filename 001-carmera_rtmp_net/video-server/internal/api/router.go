@@ -7,6 +7,7 @@ import "net/http"
 // precedence over the "/" fallback.
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/health", h.health)
+	mux.HandleFunc("GET /api/net/addresses", h.networkAddresses)
 	mux.HandleFunc("GET /api/cameras", h.listCameras)
 	mux.HandleFunc("POST /api/cameras", h.createCamera)
 	mux.HandleFunc("GET /api/cameras/{id}", h.getCamera)

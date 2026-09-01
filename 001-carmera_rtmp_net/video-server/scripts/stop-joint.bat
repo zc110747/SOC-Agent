@@ -10,15 +10,16 @@ REM ============================================================================
 
 echo [*] Stopping joint run ...
 
-taskkill /F /T /IM video-server.exe >nul 2>&1
-taskkill /F /IM camera-agent.exe    >nul 2>&1
+taskkill /F /T /IM video-server.exe     >nul 2>&1
+taskkill /F /T /IM video-server.new.exe >nul 2>&1
+taskkill /F /IM camera-agent.exe        >nul 2>&1
 taskkill /F /IM mediamtx.exe        >nul 2>&1
 taskkill /F /IM ffplay.exe          >nul 2>&1
 
 C:\Windows\System32\timeout.exe /t 2 >nul 2>&1
 
 set "LEFT="
-for %%p in (video-server.exe camera-agent.exe mediamtx.exe) do (
+for %%p in (video-server.exe video-server.new.exe camera-agent.exe mediamtx.exe) do (
   tasklist /FI "IMAGENAME eq %%p" 2>nul | findstr /i "%%p" >nul && set "LEFT=!LEFT! %%p"
 )
 

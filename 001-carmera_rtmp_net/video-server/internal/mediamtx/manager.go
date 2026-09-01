@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,6 +18,7 @@ import (
 
 	"video-server/internal/config"
 	"video-server/internal/logger"
+	"video-server/internal/netiface"
 )
 
 // Path mirrors the relevant fields of a MediaMTX v3 API path object.
@@ -82,28 +82,77 @@ func resolveBinary(p string) string {
 	return p
 }
 
+// findBinary resolves the MediaMTX binary using a fallback chain so the server
+// starts on any machine without manual config edits:
+//  1. the explicit path from config (with .exe appended on Windows if missing)
+//  2. the workspace-bundled copy at ./mediamtx/mediamtx(.exe)
+//  3. mediamtx(.exe) resolved via the system PATH
+//
+// This is what lets a config that points at a developer's local install
+// (e.g. D:/data/agent-tools/...) still boot on a machine where that path does
+// not exist: it transparently falls back to the bundled or PATH binary.
+func findBinary(cfg *config.Config) (string, error) {
+	candidates := make([]string, 0, 3)
+	if cfg.MediaMTX.Binary != "" {
+		candidates = append(candidates, resolveBinary(cfg.MediaMTX.Binary))
+	}
+	bundled := "mediamtx/mediamtx"
+	if runtime.GOOS == "windows" {
+		bundled += ".exe"
+	}
+	candidates = append(candidates, bundled)
+	if p, err := exec.LookPath("mediamtx"); err == nil {
+		candidates = append(candidates, p)
+	}
+
+	seen := make(map[string]struct{}, len(candidates))
+	for _, c := range candidates {
+		if _, dup := seen[c]; dup {
+			continue
+		}
+		seen[c] = struct{}{}
+		if _, err := os.Stat(c); err == nil {
+			logger.Info("using mediamtx binary: %s", c)
+			return c, nil
+		}
+	}
+	return "", fmt.Errorf("mediamtx binary not found; tried [%s] (set mediamtx.binary in config)", strings.Join(candidates, ", "))
+}
+
 // GenerateConfig writes the MediaMTX YAML derived from our Config so that ports
 // stay the single source of truth. It is regenerated on every start. The file is
 // written to a unique temp name inside the configured config directory so that
 // (a) it never clobbers a checked-in config file and (b) repeated starts never
 // try to overwrite a pre-existing file (which some sandboxes forbid).
 func (m *Manager) GenerateConfig() error {
+	// Media ports bind to mediamtx.bind (0.0.0.0 by default) so cameras and
+	// players anywhere on the LAN can push/pull. The control API is a separate
+	// bind address and defaults to loopback - only this server uses it, so
+	// there is no reason to hand full stream control to the whole network.
 	body := fmt.Sprintf(`logLevel: info
 api: true
-apiAddress: :%d
+apiAddress: %s
 rtsp: true
-rtspAddress: :%d
-rtpAddress: :8000
+rtspAddress: %s
+rtpAddress: :%d
+rtcpAddress: :%d
 webrtc: true
-webrtcAddress: :%d
+webrtcAddress: %s
 hls: true
-hlsAddress: :%d
+hlsAddress: %s
 playback: false
 record: false
 paths:
   all_others:
     source: publisher
-`, m.cfg.MediaMTX.APIPort, m.cfg.RTSP.Port, m.cfg.WebRTC.Port, m.cfg.MediaMTX.HLSPort)
+`,
+		m.cfg.APIListenAddr(),
+		m.cfg.MediaListenAddr(m.cfg.RTSP.Port),
+		m.cfg.MediaMTX.RTPPort,
+		m.cfg.MediaMTX.RTCPPort,
+		m.cfg.MediaListenAddr(m.cfg.WebRTC.Port),
+		m.cfg.MediaListenAddr(m.cfg.MediaMTX.HLSPort),
+	)
 
 	dir := dirOf(m.cfg.MediaMTX.Config)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -130,9 +179,9 @@ func (m *Manager) Start(ctx context.Context) error {
 	if err := m.GenerateConfig(); err != nil {
 		return err
 	}
-	binary := resolveBinary(m.cfg.MediaMTX.Binary)
-	if _, err := os.Stat(binary); err != nil {
-		return fmt.Errorf("mediamtx binary not found at %q (set mediamtx.binary in config)", binary)
+	binary, err := findBinary(m.cfg)
+	if err != nil {
+		return err
 	}
 	cmd := exec.Command(binary, m.generatedPath)
 	cmd.Stdout = &logWriter{}
@@ -271,18 +320,8 @@ func dirOf(p string) string {
 	return "."
 }
 
-// LocalIP returns the first non-loopback IPv4, used to build LAN-facing URLs.
+// LocalIP returns the machine's primary non-loopback IPv4, used to build
+// LAN-facing URLs. It is a thin wrapper kept for existing callers.
 func LocalIP() string {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return "127.0.0.1"
-	}
-	for _, a := range addrs {
-		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ip4 := ipnet.IP.To4(); ip4 != nil {
-				return ip4.String()
-			}
-		}
-	}
-	return "127.0.0.1"
+	return netiface.Primary()
 }

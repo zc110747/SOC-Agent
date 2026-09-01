@@ -28,7 +28,24 @@ cd ..
 
 echo [3/3] building video-server
 "%GO_BIN%" build -trimpath -o video-server.exe ./cmd/video-server
-if %errorlevel% neq 0 exit /b %errorlevel%
+if %errorlevel% equ 0 (
+  echo build complete: video-server.exe
+  endlocal
+  exit /b 0
+)
 
-echo build complete: video-server.exe
+REM video-server.exe could not be written. The usual cause is that the old
+REM binary is still running (Windows keeps an exclusive handle on a running
+REM .exe), so fall back to a second name instead of failing the build.
+echo [WARN] video-server.exe is locked - is an old instance still running?
+echo        Retrying as video-server.new.exe ...
+"%GO_BIN%" build -trimpath -o video-server.new.exe ./cmd/video-server
+if %errorlevel% neq 0 (
+  echo.
+  echo [ERROR] build failed. Stop the running server first:
+  echo         scripts\stop-joint.bat   or   taskkill /F /IM video-server.exe
+  exit /b 1
+)
+echo build complete: video-server.new.exe  (run.bat uses it automatically)
+
 endlocal

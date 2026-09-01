@@ -2,9 +2,13 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 
 	"gopkg.in/yaml.v3"
+
+	"video-server/internal/netiface"
 )
 
 // Config is the top-level Video Server configuration loaded from config/config.yaml.
@@ -18,8 +22,19 @@ type Config struct {
 }
 
 type ServerConfig struct {
+	// Host is what goes into the URLs shown to clients (RTSP/WebRTC/HLS).
+	// Leave it empty or set it to "auto" to advertise this machine's LAN
+	// address, which is what makes the URLs work from another computer.
 	Host     string `yaml:"host"`
 	HTTPPort int    `yaml:"http_port"`
+	// Bind is the listen address. Defaults to 0.0.0.0 so the same port is
+	// served on every IPv4 address this machine has (LAN, Wi-Fi, VPN...).
+	// Set it to 127.0.0.1 to keep the server local-only again.
+	Bind string `yaml:"bind"`
+
+	// publicHost is the resolved form of Host: wildcards are replaced by the
+	// primary LAN address once, at load time, so URL building stays cheap.
+	publicHost string
 }
 
 type RTSPConfig struct {
@@ -38,10 +53,22 @@ type DatabaseConfig struct {
 // APIPort is the MediaMTX control API port (used for camera discovery).
 // HLSPort is only used to build optional HLS URLs.
 type MediaMTXConfig struct {
-	Binary  string `yaml:"binary"`
-	Config  string `yaml:"config"`
+	Binary string `yaml:"binary"`
+	Config string `yaml:"config"`
+	// Bind is the listen address for the media ports (RTSP / WebRTC / HLS).
+	// Defaults to 0.0.0.0 so cameras and players on the LAN can reach them.
+	Bind string `yaml:"bind"`
+	// APIBind is the listen address of the MediaMTX control API. It defaults
+	// to 127.0.0.1 because only this server talks to it - there is no reason
+	// to expose full stream control to the whole LAN.
+	APIBind string `yaml:"api_bind"`
 	APIPort int    `yaml:"api_port"`
 	HLSPort int    `yaml:"hls_port"`
+	// RTP/RTCP are the UDP ports MediaMTX receives interleaved/RTP media on.
+	// They are configurable so two servers can run side by side (a second
+	// instance would otherwise collide on the 8000/8001 defaults).
+	RTPPort  int `yaml:"rtp_port"`
+	RTCPPort int `yaml:"rtcp_port"`
 }
 
 type LogConfig struct {
@@ -53,11 +80,11 @@ type LogConfig struct {
 // in the YAML file overrides the corresponding default.
 func Default() *Config {
 	return &Config{
-		Server:   ServerConfig{Host: "localhost", HTTPPort: 8080},
+		Server:   ServerConfig{Host: "auto", Bind: "0.0.0.0", HTTPPort: 8080},
 		RTSP:     RTSPConfig{Port: 8554},
 		WebRTC:   WebRTCConfig{Port: 8889},
 		Database: DatabaseConfig{Path: "data/video.db"},
-		MediaMTX: MediaMTXConfig{Binary: "./mediamtx/mediamtx", Config: "./config/mediamtx.yml", APIPort: 9997, HLSPort: 8888},
+		MediaMTX: MediaMTXConfig{Binary: "./mediamtx/mediamtx", Config: "./config/mediamtx.yml", Bind: "0.0.0.0", APIBind: "127.0.0.1", APIPort: 9997, HLSPort: 8888, RTPPort: 8000, RTCPPort: 8001},
 		Log:      LogConfig{Level: "info"},
 	}
 }
@@ -78,6 +105,9 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
 	}
 	applyDefaults(cfg)
+	// Resolve the advertised host once: with host: auto (or 0.0.0.0) the LAN
+	// address is baked in here, so every later URL build is a plain field read.
+	cfg.RefreshPublicHost()
 	return cfg, nil
 }
 
@@ -85,8 +115,12 @@ func applyDefaults(cfg *Config) {
 	if cfg.Server.HTTPPort == 0 {
 		cfg.Server.HTTPPort = 8080
 	}
+	if cfg.Server.Bind == "" {
+		// Bind to every IPv4 address so one port serves the whole LAN.
+		cfg.Server.Bind = "0.0.0.0"
+	}
 	if cfg.Server.Host == "" {
-		cfg.Server.Host = "localhost"
+		cfg.Server.Host = "auto"
 	}
 	if cfg.RTSP.Port == 0 {
 		cfg.RTSP.Port = 8554
@@ -103,20 +137,71 @@ func applyDefaults(cfg *Config) {
 	if cfg.MediaMTX.Config == "" {
 		cfg.MediaMTX.Config = "./config/mediamtx.yml"
 	}
+	if cfg.MediaMTX.Bind == "" {
+		cfg.MediaMTX.Bind = "0.0.0.0"
+	}
+	if cfg.MediaMTX.APIBind == "" {
+		// Control API stays loopback-only: only this server needs it.
+		cfg.MediaMTX.APIBind = "127.0.0.1"
+	}
 	if cfg.MediaMTX.APIPort == 0 {
 		cfg.MediaMTX.APIPort = 9997
 	}
 	if cfg.MediaMTX.HLSPort == 0 {
 		cfg.MediaMTX.HLSPort = 8888
 	}
+	if cfg.MediaMTX.RTPPort == 0 {
+		cfg.MediaMTX.RTPPort = 8000
+	}
+	if cfg.MediaMTX.RTCPPort == 0 {
+		cfg.MediaMTX.RTCPPort = 8001
+	}
 	if cfg.Log.Level == "" {
 		cfg.Log.Level = "info"
 	}
 }
 
-// RTSPURL builds the public RTSP URL for a stream path.
+// PublicHost returns the host advertised to clients. It equals server.host for
+// an explicit value, and the machine's primary LAN IPv4 when the config uses
+// "auto"/"0.0.0.0" (resolved once at load time).
+func (c *Config) PublicHost() string {
+	if c.Server.publicHost != "" {
+		return c.Server.publicHost
+	}
+	// Config built programmatically (tests) without going through Load.
+	return netiface.ResolvePublicHost(c.Server.Host)
+}
+
+// RefreshPublicHost re-resolves the advertised host after Host/Bind were
+// changed at runtime (e.g. by the -bind flag). A loopback bind downgrades the
+// advertised host to 127.0.0.1, since a LAN address would be undialable.
+func (c *Config) RefreshPublicHost() {
+	host := c.Server.Host
+	if netiface.IsWildcard(host) && netiface.IsLoopbackBind(c.Server.Bind) {
+		host = "127.0.0.1"
+	}
+	c.Server.publicHost = netiface.ResolvePublicHost(host)
+}
+
+// HTTPListenAddr is the address the HTTP server binds to.
+func (c *Config) HTTPListenAddr() string {
+	return net.JoinHostPort(c.Server.Bind, strconv.Itoa(c.Server.HTTPPort))
+}
+
+// MediaListenAddr builds a MediaMTX listen address from its bind host + port.
+func (c *Config) MediaListenAddr(port int) string {
+	return net.JoinHostPort(c.MediaMTX.Bind, strconv.Itoa(port))
+}
+
+// APIListenAddr builds the MediaMTX control API listen address.
+func (c *Config) APIListenAddr() string {
+	return net.JoinHostPort(c.MediaMTX.APIBind, strconv.Itoa(c.MediaMTX.APIPort))
+}
+
+// RTSPURL builds the public RTSP URL for a stream path, using the advertised
+// (LAN) host so the URL works from another machine, not just from this box.
 func (c *Config) RTSPURL(path string) string {
-	return fmt.Sprintf("rtsp://%s:%d/%s", c.Server.Host, c.RTSP.Port, path)
+	return fmt.Sprintf("rtsp://%s:%d/%s", c.PublicHost(), c.RTSP.Port, path)
 }
 
 // APIAddr returns the MediaMTX control API address the server talks to (loopback).

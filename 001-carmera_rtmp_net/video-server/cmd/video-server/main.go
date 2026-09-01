@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -17,19 +18,47 @@ import (
 	"video-server/internal/logger"
 	"video-server/internal/mediamtx"
 	"video-server/internal/monitor"
+	"video-server/internal/netiface"
 	"video-server/internal/server"
 )
 
+const defaultConfigPath = "config/config.yaml"
+
 func main() {
-	cfgPath := "config/config.yaml"
-	if len(os.Args) > 1 {
-		cfgPath = os.Args[1]
+	// Flags first; a bare positional argument is still accepted as the config
+	// path so existing scripts (scripts\run.bat <config>) keep working.
+	cfgPath := defaultConfigPath
+	bind := ""
+	fs := flag.NewFlagSet("video-server", flag.ContinueOnError)
+	fs.StringVar(&cfgPath, "config", defaultConfigPath, "path to the YAML config file")
+	fs.StringVar(&bind, "bind", "", "override server.bind (e.g. 0.0.0.0 for the whole LAN, 127.0.0.1 for local only)")
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage: video-server [-config <file>] [-bind <addr>]\n\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		if err == flag.ErrHelp {
+			os.Exit(0)
+		}
+		os.Exit(2)
+	}
+	// A positional argument only wins when -config was left at its default.
+	if fs.NArg() > 0 && cfgPath == defaultConfigPath {
+		cfgPath = fs.Arg(0)
 	}
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
 		os.Exit(1)
+	}
+	if bind != "" {
+		cfg.Server.Bind = bind
+	}
+	if netiface.IsWildcard(cfg.Server.Host) {
+		// Re-resolve: the advertised host now follows an explicit -bind.
+		cfg.Server.Host = "auto"
+		cfg.RefreshPublicHost()
 	}
 
 	logger.SetLevel(cfg.Log.Level)

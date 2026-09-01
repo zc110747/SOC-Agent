@@ -51,7 +51,10 @@ REM randomly fail to bind. Override with: set VS_CONFIG=config.yaml
 set CFG_NAME=config.joint.yaml
 if defined VS_CONFIG set CFG_NAME=%VS_CONFIG%
 set CFG=%ROOT%\config\%CFG_NAME%
+REM Prefer the canonical binary; fall back to the alternate name build.bat
+REM produces when video-server.exe is locked by a still-running instance.
 set VS_EXE=%ROOT%\video-server.exe
+if not exist "%VS_EXE%" if exist "%ROOT%\video-server.new.exe" set VS_EXE=%ROOT%\video-server.new.exe
 set CA_EXE=%AGENT_DIR%\build-msvc\src\camera-agent.exe
 
 echo ============================================================
@@ -192,12 +195,26 @@ REM ---- (8) open the Web UI ----
 if "%NO_BROWSER%"=="0" start "" http://localhost:%HTTP_PORT%/
 
 REM ---- summary ----
+REM The server binds 0.0.0.0, so the same port is served on every local
+REM address. Showing the LAN address here saves the usual "which IP do I use"
+REM guesswork - the server prints the full list in logs\video-server.log and
+REM exposes it as GET /api/net/addresses.
+set "LAN_IP="
+for /f "usebackq tokens=*" %%i in (`powershell -NoProfile -Command "(Get-NetIPAddress -AddressFamily IPv4 ^| Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } ^| Sort-Object -Property InterfaceMetric ^| Select-Object -First 1).IPAddress"`) do set "LAN_IP=%%i"
+
 echo.
 echo ============================================================
 echo  Joint run started
 echo  Web UI      : http://localhost:%HTTP_PORT%/
 echo  REST API    : http://localhost:%HTTP_PORT%/api/cameras
 echo  RTSP stream : rtsp://127.0.0.1:%RTSP_PORT%/%STREAM_ID%
+if defined LAN_IP (
+  echo  --- from another machine on the LAN ---
+  echo  Web UI      : http://%LAN_IP%:%HTTP_PORT%/
+  echo  RTSP stream : rtsp://%LAN_IP%:%RTSP_PORT%/%STREAM_ID%
+  echo  If it times out, open the firewall first:
+  echo     scripts\firewall-add.bat %HTTP_PORT% %RTSP_PORT%
+)
 echo  Camera      : index %CAMERA_ID%  - negotiated natively via --auto
 echo  Logs        : %LOGS%\  (video-server.log / agent.log)
 echo  Verify      : python scripts\verify_joint.py

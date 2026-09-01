@@ -119,15 +119,20 @@ scripts\build.bat
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `server.host` | `localhost` | 用于拼接对外 RTSP/WebRTC URL |
+| `server.host` | `auto` | 对外 URL 使用的主机。`auto`/`0.0.0.0` = 自动取本机局域网 IPv4；也可写死 IP 或域名 |
+| `server.bind` | `0.0.0.0` | HTTP 监听地址。`0.0.0.0` = 本机任意 IPv4 的同一端口（局域网可达）；`127.0.0.1` = 仅本机 |
 | `server.http_port` | `8080` | REST API 与 Web UI |
 | `rtsp.port` | `8554` | MediaMTX RTSP 端口 |
 | `webrtc.port` | `8889` | MediaMTX WebRTC 端口 |
 | `database.path` | `data/video.db` | SQLite 路径（目录自动创建） |
 | `mediamtx.binary` | `./mediamtx/mediamtx` | MediaMTX 可执行文件 |
 | `mediamtx.config` | `./data/mediamtx.yml` | 运行时生成的配置落点（源 config/ 不被覆盖） |
+| `mediamtx.bind` | `0.0.0.0` | 媒体端口（RTSP/WebRTC/HLS）监听地址 |
+| `mediamtx.api_bind` | `127.0.0.1` | MediaMTX **控制 API** 监听地址，仅本机（只有本服务轮询它） |
 | `mediamtx.api_port` | `9997` | MediaMTX 控制 API（路径发现用） |
 | `mediamtx.hls_port` | `8888` | HLS 端口（可选） |
+| `mediamtx.rtp_port` | `8000` | RTP UDP 端口（多实例并存时改它避免冲突） |
+| `mediamtx.rtcp_port` | `8001` | RTCP UDP 端口 |
 | `log.level` | `info` | `debug/info/warn/error` |
 | `log.file` | 空 | 留空则日志打到 stdout |
 
@@ -157,6 +162,65 @@ record: false
 4. 监听 `http_port` 提供 API 与 Web UI。
 
 Ctrl+C 优雅退出（先停 HTTP，再停 MediaMTX 并清理临时配置）。
+
+### 6.1 局域网访问（任意 IP 同一端口）
+
+默认配置已经是"局域网可达"的：`server.bind: 0.0.0.0` 让**同一个端口同时服务本机所有 IPv4**（以太网/Wi-Fi/虚拟网卡），`server.host: auto` 让对外 URL 里的主机自动解析成局域网 IP，而不是只能本机用的 `localhost`。
+
+启动后会打印全部可访问地址，不需要再去 `ipconfig` 里猜：
+
+```
+INFO  http server listening on 0.0.0.0:8081 (all local IPv4+IPv6 addresses)  [socket=[::]:8081]
+INFO  ==========================================================================
+INFO   video-server ready
+INFO  --------------------------------------------------------------------------
+INFO   HTTP listen   : 0.0.0.0:8081  (same port on every local IP)
+INFO   Web UI (local): http://127.0.0.1:8081/
+INFO   Web UI (LAN)  : http://192.168.3.5:8081/   (WLAN)
+INFO   Web UI (LAN)  : http://198.18.0.1:8081/   (BeiBei)
+INFO  --------------------------------------------------------------------------
+INFO   RTSP push/pull: rtsp://192.168.3.5:8554/<stream-path>
+INFO   WebRTC play   : open the Web UI above (signaling proxied by the server, port 8889)
+INFO   HLS (optional): http://192.168.3.5:8888/<stream-path>/index.m3u8
+INFO   MediaMTX API  : http://127.0.0.1:9997  (bind=127.0.0.1, used by the monitor only)
+INFO  --------------------------------------------------------------------------
+INFO   Media bind    : 0.0.0.0  -> RTSP 8554 / WebRTC 8889 / HLS 8888
+INFO  ==========================================================================
+```
+
+排序规则：真实私网 LAN 地址（192.168/10/172.16-31）优先，虚拟网卡标注 `[virtual NIC]`，APIPA 标注 `[link-local]`，回环地址排在最后。
+
+**同一份信息也能通过接口拿到**（UI 或脚本用）：
+
+```bash
+curl http://<任意本机IP>:8081/api/net/addresses
+# {"bind":"0.0.0.0","http_port":8081,"public_host":"192.168.3.5",
+#  "rtsp_url":"rtsp://192.168.3.5:8554/<stream-path>",
+#  "addresses":[{"ip":"192.168.3.5","interface":"WLAN","private":true,...}],
+#  "web_ui_urls":["http://192.168.3.5:8081/","http://127.0.0.1:8081/"]}
+```
+
+**命令行覆盖**（临时切换，不改配置）：
+
+```bash
+./video-server.exe -config config/config.joint.yaml -bind 0.0.0.0   # 全网卡
+./video-server.exe -bind 127.0.0.1                                  # 临时只本机
+```
+
+`-bind 127.0.0.1` 时对外 URL 会自动降级成 `127.0.0.1`，不会把别的机器指向一个拨不通的 LAN 地址。
+
+**另一台机器连不上时，按顺序排查：**
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 浏览器 `ERR_CONNECTION_TIMED_OUT` | Windows 防火墙拦掉入站（最常见） | 管理员运行 `scripts\firewall-add.bat`（或显式给端口：`scripts\firewall-add.bat 8081 8554 8889 8888`） |
+| `ERR_CONNECTION_REFUSED` | 服务没起来 / 端口被占 | 看日志里的 `HTTP listen` 行；换 `server.http_port` |
+| 打得开页面但播放失败 | 媒体的 UDP 侧被拦 | 放行 `mediamtx.exe` 程序规则（`firewall-add.bat` 已加）；或用 RTSP-TCP 传输 |
+| 地址不对（192.168 之外） | 选到了虚拟网卡 | 显式写 `server.host: 192.168.x.x` |
+
+撤销放行规则：`scripts\firewall-remove.bat`。
+
+> 安全提示：MediaMTX 的**控制 API**（默认 `api_bind: 127.0.0.1:9997`）只对内监听 —— 它没有任何鉴权，暴露到局域网等于把每一路流的控制权交出去。媒体端口（RTSP/WebRTC/HLS）同理无鉴权，只在可信网络内开放。
 
 ---
 
@@ -333,6 +397,7 @@ scripts\test-stream.bat camera01
 | 方法 & 路径 | 说明 |
 |---|---|
 | `GET /api/health` | 返回 `{"status","database","media_server"}` |
+| `GET /api/net/addresses` | 监听地址 + 全部可访问 IP/URL（`bind`、`public_host`、`web_ui_urls`、`addresses`） |
 | `GET /api/cameras` | 摄像头列表（含 `rtsp_url`） |
 | `POST /api/cameras` | 创建摄像头（`id` 必填） |
 | `GET /api/cameras/{id}` | 单个摄像头详情 |

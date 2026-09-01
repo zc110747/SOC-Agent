@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
 	"strings"
 
@@ -16,6 +17,7 @@ import (
 	"video-server/internal/logger"
 	"video-server/internal/mediamtx"
 	"video-server/internal/monitor"
+	"video-server/internal/netiface"
 	"video-server/web"
 )
 
@@ -52,15 +54,99 @@ func (s *Server) Start(ctx context.Context) error {
 		mux.Handle("/", spaHandler(sub))
 	}
 
-	s.httpServer = &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.cfg.Server.HTTPPort),
-		Handler: mux,
+	// Listen explicitly (instead of ListenAndServe) so we can log the real
+	// bound address and then print every URL a client can actually reach.
+	ln, err := net.Listen("tcp", s.cfg.HTTPListenAddr())
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", s.cfg.HTTPListenAddr(), err)
 	}
-	logger.Info("http server listening on http://%s:%d", s.cfg.Server.Host, s.cfg.Server.HTTPPort)
-	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	s.httpServer = &http.Server{Addr: ln.Addr().String(), Handler: mux}
+
+	// Go reports a dual-stack wildcard bind as "[::]:port", which reads as if
+	// the server were IPv6-only. Say what it actually means.
+	listenDesc := s.cfg.HTTPListenAddr()
+	if netiface.IsWildcard(s.cfg.Server.Bind) {
+		listenDesc = fmt.Sprintf("%s (all local IPv4+IPv6 addresses)", s.cfg.HTTPListenAddr())
+	}
+	logger.Info("http server listening on %s  [socket=%s]", listenDesc, ln.Addr().String())
+	printAccessBanner(s.cfg)
+
+	if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil
+}
+
+// printAccessBanner logs every address the service can be reached on: the
+// loopback URL for this machine plus one URL per LAN address, and the media
+// endpoints cameras/players need. Without this the only visible URL is
+// localhost, which is useless from another computer.
+func printAccessBanner(cfg *config.Config) {
+	sep := strings.Repeat("=", 74)
+	line := strings.Repeat("-", 74)
+	logger.Info(sep)
+	logger.Info(" video-server ready")
+	logger.Info(line)
+	if netiface.IsWildcard(cfg.Server.Bind) {
+		logger.Info(" HTTP listen   : %s  (same port on every local IP)", cfg.HTTPListenAddr())
+	} else {
+		logger.Info(" HTTP listen   : %s", cfg.HTTPListenAddr())
+	}
+
+	// Only list the addresses the listener can actually answer on. A
+	// wildcard bind covers every local IP; a specific bind covers just that.
+	bindIP := cfg.Server.Bind
+	wildcard := netiface.IsWildcard(bindIP)
+	loopbackOnly := netiface.IsLoopbackBind(bindIP)
+
+	if loopbackOnly {
+		logger.Info(" Web UI (local): http://127.0.0.1:%d/  (bind=%s: local only)", cfg.Server.HTTPPort, bindIP)
+	} else {
+		logger.Info(" Web UI (local): http://127.0.0.1:%d/", cfg.Server.HTTPPort)
+	}
+
+	if !loopbackOnly {
+		// Filter first: a wildcard bind covers every local IP, a specific bind
+		// only answers on that one, so the two cases list different URLs.
+		var lan []netiface.Address
+		for _, a := range netiface.LAN() {
+			if wildcard || a.IP == bindIP {
+				lan = append(lan, a)
+			}
+		}
+		if len(lan) == 0 {
+			logger.Warn(" no reachable IPv4 address detected - other machines cannot connect")
+		}
+		const maxShown = 8 // keep the banner readable on machines with many NICs
+		for i, a := range lan {
+			if i >= maxShown {
+				logger.Info("                 ... and %d more (see GET /api/net/addresses)", len(lan)-maxShown)
+				break
+			}
+			tag := ""
+			if a.Virtual {
+				tag = " [virtual NIC]"
+			} else if a.LinkLocal {
+				tag = " [link-local]"
+			}
+			logger.Info(" Web UI (LAN)  : http://%s:%d/   (%s)%s", a.IP, cfg.Server.HTTPPort, a.Interface, tag)
+		}
+	}
+
+	logger.Info(line)
+	logger.Info(" RTSP push/pull: rtsp://%s:%d/<stream-path>", cfg.PublicHost(), cfg.RTSP.Port)
+	logger.Info(" WebRTC play   : open the Web UI above (signaling proxied by the server, port %d)", cfg.WebRTC.Port)
+	logger.Info(" HLS (optional): http://%s:%d/<stream-path>/index.m3u8", cfg.PublicHost(), cfg.MediaMTX.HLSPort)
+	logger.Info(" MediaMTX API  : http://%s  (bind=%s, used by the monitor only)", cfg.APIListenAddr(), cfg.MediaMTX.APIBind)
+	logger.Info(line)
+	logger.Info(" Media bind    : %s  -> RTSP %d / WebRTC %d / HLS %d",
+		cfg.MediaMTX.Bind, cfg.RTSP.Port, cfg.WebRTC.Port, cfg.MediaMTX.HLSPort)
+	if !loopbackOnly {
+		logger.Info(" NOTE: if another machine cannot connect, allow the ports through the")
+		logger.Info("       firewall first:  scripts\\firewall-add.bat %d %d %d %d",
+			cfg.Server.HTTPPort, cfg.RTSP.Port, cfg.WebRTC.Port, cfg.MediaMTX.HLSPort)
+	}
+	logger.Info(sep)
 }
 
 // Shutdown gracefully stops the HTTP server, MediaMTX and closes the database.

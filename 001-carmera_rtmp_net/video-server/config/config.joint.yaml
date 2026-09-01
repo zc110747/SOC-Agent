@@ -11,15 +11,26 @@
 #   every port lives in this file, none are hardcoded in the source.
 #
 # Ports in use by the joint run:
-#   8081  HTTP      REST API + embedded Web UI
+#   8081  HTTP      REST API + embedded Web UI       bind 0.0.0.0 (LAN)
 #   8554  RTSP      where camera-agent pushes, and where players pull from
 #   9997  HTTP      MediaMTX control API (polled by the server's monitor)
+#                   bind 127.0.0.1 - internal only, never exposed to the LAN
 #   8889  HTTP      MediaMTX WebRTC (WHEP signaling, proxied by the server)
 #   8888  HTTP      MediaMTX HLS (optional)
+#
+# LAN access: bind is 0.0.0.0, so every IPv4 on this machine serves the same
+# port. The server prints all reachable URLs on startup (also available as
+# GET /api/net/addresses). If another machine cannot connect, allow the ports:
+#   scripts\firewall-add.bat 8081 8554 8889 8888
 
 server:
-  host: localhost
+  # "auto" advertises the LAN IPv4 inside the RTSP/WebRTC/HLS URLs handed to
+  # clients, so those URLs work from other machines - not just from this box.
+  host: auto
   http_port: 8081
+  # 0.0.0.0 = one port, every local IPv4. LAN clients open
+  # http://<this-machine-ip>:8081/  Use 127.0.0.1 for local-only.
+  bind: 0.0.0.0
 
 rtsp:
   port: 8554
@@ -33,9 +44,15 @@ database:
 mediamtx:
   # Local dev override: the MediaMTX binary installed on this machine.
   # On a fresh clone, point this at your own mediamtx(.exe).
-  binary: D:/data/agent-tools/mediamtx_v1.20.1_windows_amd64/mediamtx.exe
+  binary: mediamtx.exe
   # Runtime generated config (unique temp name inside this directory).
   config: ./data/mediamtx.yml
+  # Media ports (RTSP/WebRTC/HLS) listen on all interfaces so cameras and
+  # players on the LAN can push and pull.
+  bind: 0.0.0.0
+  # Control API stays loopback-only: only this server polls it. Exposing it
+  # would give the whole LAN full control over every stream.
+  api_bind: 127.0.0.1
   # MediaMTX control API port - the server's monitor polls this to discover
   # cameras. This is the reason the joint run must NOT start a second
   # MediaMTX: only this instance exposes the API.
