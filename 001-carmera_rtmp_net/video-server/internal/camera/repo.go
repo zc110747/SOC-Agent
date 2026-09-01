@@ -173,15 +173,40 @@ func (r *Repository) Delete(id string) error {
 // If it already exists its status/last_seen are refreshed; otherwise it is
 // auto-registered with name=path and status=online. This is the heart of the
 // "camera auto-registration" feature.
-func (r *Repository) UpsertByStreamPath(path string, status Status, lastSeen time.Time) (Camera, error) {
+//
+// resolution is the "WxH" the publisher negotiated, as reported by MediaMTX.
+// fps/bitrate are filled in by the monitor (ffprobe / bytesReceived delta).
+// Empty/zero values are intentionally NOT overwritten: a scan that runs before
+// the codec properties or stream probe are ready must not wipe good data.
+func (r *Repository) UpsertByStreamPath(path string, status Status, lastSeen time.Time, resolution string, fps int, bitrate int) (Camera, error) {
 	existing, err := r.GetByStreamPath(path)
 	if err == nil {
 		existing.Status = status
 		ls := lastSeen.UTC().Format(timeFmt)
-		_, uerr := r.db.Exec(
-			`UPDATE cameras SET status=?, last_seen=?, updated_at=? WHERE id=?`,
-			status, ls, time.Now().UTC().Format(timeFmt), existing.ID)
-		if uerr != nil {
+		now := time.Now().UTC().Format(timeFmt)
+
+		// Build the SET clause dynamically: only known, non-empty values are
+		// written, so a single scan can refresh any subset of the metrics.
+		setCols := []string{"status=?", "last_seen=?", "updated_at=?"}
+		args := []any{status, ls, now}
+		if resolution != "" {
+			setCols = append(setCols, "resolution=?")
+			args = append(args, resolution)
+			existing.Resolution = resolution
+		}
+		if fps > 0 {
+			setCols = append(setCols, "fps=?")
+			args = append(args, fps)
+			existing.FPS = fps
+		}
+		if bitrate > 0 {
+			setCols = append(setCols, "bitrate=?")
+			args = append(args, bitrate)
+			existing.Bitrate = bitrate
+		}
+		args = append(args, existing.ID)
+		if _, uerr := r.db.Exec(
+			`UPDATE cameras SET `+strings.Join(setCols, ", ")+` WHERE id=?`, args...); uerr != nil {
 			return existing, uerr
 		}
 		existing.LastSeen = &lastSeen
@@ -194,6 +219,9 @@ func (r *Repository) UpsertByStreamPath(path string, status Status, lastSeen tim
 		Name:       path,
 		StreamPath: path,
 		Status:     status,
+		Resolution: resolution,
+		FPS:        fps,
+		Bitrate:    bitrate,
 		LastSeen:   &lastSeen,
 	}
 	if cerr := r.Create(c); cerr != nil {

@@ -129,5 +129,28 @@ ctest --test-dir build --output-on-failure        # 10/10 单测
 # 真机后端
 .\scripts\build-msvc.ps1 -Backend gstreamer
 .\build-msvc\src\camera-agent.exe --list           # 枚举摄像头
+.\build-msvc\src\camera-agent.exe --auto           # 自动协商分辨率
 .\start-camera-agent.bat                           # 一键推流+拉流验证
 ```
+
+## 十一、构建输出读取与运行陷阱（补）
+
+| 陷阱 | 现象 | 处理 |
+|------|------|------|
+| **PowerShell stdout 不回显** | 跑了构建脚本啥也看不到，以为失败 | 一律 `2>&1 \| Tee-Object -FilePath build-msvc\build.log`，再读文件 |
+| **build.log 是 UTF-16LE** | 按 UTF-8 读全是乱码/空 | `python -c "d=open(p,'rb').read().decode('utf-16','replace')"` 后 grep warning/error |
+| **exe mtime 没变** | 以为构建成功其实没重编 | **必须**对比 `ls --time-style=full-iso` 的源文件与 exe mtime。改了源码而 exe 时间戳没动 = 构建没真跑 |
+| **增量构建静默跳过** | 只改头文件时部分 target 不重建 | 加 `-Clean` 重生成，或删 `build-msvc/` |
+| **Git Bash 跑 exe 缺 DLL** | `gio-2.0-0.dll 缺失` | 先 `export PATH="/c/Program Files/gstreamer/1.0/msvc_x86_64/bin:$PATH"`（Bash 不继承系统 GStreamer PATH） |
+| **exe 前台运行被安全策略拦** | 直接跑没反应 | 用 Bash 工具 `run_in_background`；`start cmd /c` 也会被拦 |
+
+**零警告校验范式**（构建后必做，别只看 exit code）：
+```bash
+python -c "d=open('build-msvc/build.log','rb').read().decode('utf-16','replace'); \
+import re; print('\n'.join(l for l in d.splitlines() if re.search(r'warning|error|FAILED',l,re.I)) or 'NONE')"
+ls -la --time-style=full-iso build-msvc/src/camera-agent.exe
+```
+
+> MSVC `/W4` 下两个高频警告：① 基类虚方法**形参未使用** → C4100，用 `(void)param;`；② CLI 结构体成员**命名为 `auto`** → 编译错误（关键字），改名 `auto_res`。
+>
+> 跑起来之后的调试与验证流程见 **`soc-debug-verification`**。

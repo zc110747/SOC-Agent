@@ -215,7 +215,7 @@ camera-agent --auto --source mfvideosrc --latency-probe --duration 8
 ### 一键启动（demo：MediaMTX + agent + ffplay）
 
 ```bat
-start-camera-agent.bat            :: 默认启动（CAMERA_ID=1 + --auto）
+start-camera-agent.bat            :: 默认启动（CAMERA_ID=0 + --auto）
 start-camera-agent.bat --no-pause :: 不暂停
 start-camera-agent.bat --latency-probe :: 透传延迟探针
 start-camera-agent.bat --camera 3 --auto          :: 换摄像头
@@ -230,6 +230,7 @@ start-camera-agent.bat --camera 1 --no-auto --width 640 --height 480 --fps 30
 - 日志重定向到 `tests\finished\`（agent.log / mediamtx.log）。
 - 观看端 ffplay 低延迟旗标组：`-rtsp_transport tcp -fflags nobuffer -flags low_delay -probesize 32768 -analyzeduration 0 -framedrop -max_delay 0`。
   ⚠️ 不要加 `-rtsp_flags nobuffer`：`rtsp_flags` 不接受该值，ffplay 会直接 `Invalid argument` 退出、窗口永远不出现。
+- **摄像头索引自动校验**：启动 agent 前先跑一次 `camera-agent --list` 枚举可用索引；若配置的 `CAMERA_ID` 不在其中，自动回退到第一个可用索引并打印 `[AUTO] camera index N is not available - using index M`。换机器/换 UVC 设备时无需手改脚本。若枚举失败（无摄像头或 GStreamer 不在 PATH），保留原索引并打印 `[note] could not enumerate cameras`，由后续诊断提示接手。
 
 > 为什么必须"先等流就绪再开 ffplay"：agent 报 `STREAMING` 比 mediamtx 真正注册路径早约 1 秒，此时 ffplay 发 DESCRIBE 会拿到 `404 Not Found` 并立即退出。
 

@@ -51,7 +51,7 @@ REM finds config/camera-agent.yaml regardless of where the .bat is launched from
 cd /d "%ROOT%"
 
 REM ---- defaults (only applied when not already set in the environment) ----
-if not defined CAMERA_ID     set CAMERA_ID=1
+if not defined CAMERA_ID     set CAMERA_ID=0
 if not defined CAMERA_AUTO   set CAMERA_AUTO=1
 if not defined CAMERA_WIDTH  set CAMERA_WIDTH=1280
 if not defined CAMERA_HEIGHT set CAMERA_HEIGHT=720
@@ -112,6 +112,34 @@ taskkill /F /IM mediamtx.exe >nul 2>&1
 taskkill /F /IM camera-agent.exe >nul 2>&1
 taskkill /F /IM ffplay.exe >nul 2>&1
 C:\Windows\System32\timeout.exe /t 1 >nul 2>&1
+
+REM ---- (2.5) validate / auto-pick the camera index -----------------------
+REM A wrong index makes the capture element fail to start and the agent exits
+REM immediately, which looks like "the script does nothing". Ask the binary
+REM which cameras actually exist - same enumeration as "--list" - and fall back
+REM to the first available index when the configured one is not present.
+REM If enumeration itself fails - no camera, or GStreamer not on PATH - keep the
+REM configured index so the later diagnostics still say something useful.
+"%EXE%" --list > "%FINISHED%\cameras.txt" 2>nul
+set "AVAIL_IDS="
+if exist "%FINISHED%\cameras.txt" (
+  for /f "tokens=2" %%i in ('findstr /b /c:"Camera " "%FINISHED%\cameras.txt"') do (
+    set "AVAIL_IDS=!AVAIL_IDS! %%i"
+  )
+  del "%FINISHED%\cameras.txt" >nul 2>&1
+)
+if defined AVAIL_IDS (
+  set "_old_id=%CAMERA_ID%"
+  set "_cid_found=0"
+  for %%i in (!AVAIL_IDS!) do if "%%i"=="%CAMERA_ID%" set "_cid_found=1"
+  if "!_cid_found!"=="0" (
+    for /f "tokens=1" %%i in ("!AVAIL_IDS!") do set "CAMERA_ID=%%i"
+    echo [AUTO]   camera index !_old_id! is not available - using index !CAMERA_ID!
+    echo          available camera indices:!AVAIL_IDS!
+  )
+) else (
+  echo [note]   could not enumerate cameras - keeping index %CAMERA_ID%
+)
 
 REM ---- (3) assemble camera-agent arguments ----
 set "AGENT_ARGS=--camera %CAMERA_ID% --stream %STREAM_ID% --server %RTSP_HOST% --port %RTSP_PORT%"

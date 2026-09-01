@@ -30,6 +30,18 @@ type Path struct {
 		ID   string `json:"id"`
 	} `json:"source"`
 	ReadyTime string `json:"readyTime"`
+	// Tracks2 carries per-track codec properties. This is the only place the
+	// resolution actually negotiated by the publisher is exposed: an RTSP
+	// publisher (the Camera Agent) never reports it through the control API,
+	// so we read it back from the media track instead.
+	Tracks2 []struct {
+		Codec      string         `json:"codec"`
+		CodecProps map[string]any `json:"codecProps"`
+	} `json:"tracks2"`
+	// BytesReceived is the cumulative inbound byte count for the path. The
+	// monitor samples it across scans to derive a live bitrate, which the
+	// publisher never reports on its own.
+	BytesReceived int64 `json:"bytesReceived"`
 }
 
 // PathsListResponse is the response of GET /v3/paths/list.

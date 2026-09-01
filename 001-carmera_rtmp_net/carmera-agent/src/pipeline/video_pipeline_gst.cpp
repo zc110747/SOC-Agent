@@ -39,22 +39,30 @@ bool element_available(const char* element) {
 // `gst-inspect-1.0`.
 std::string encoder_element(const std::string& enc, int bitrate, int keyint) {
     const std::string bit = " bitrate=" + std::to_string(bitrate);
+    // key-int-max is the x264/Intel property name. nvh264enc instead exposes
+    // "gop-size" (verified with gst-inspect-1.0) - passing key-int-max there is a
+    // silent no-op, leaving NVENC's default (~infinite) GOP and making WebRTC wait
+    // many seconds for the first decodable IDR. Use the right name per backend.
+    const std::string ki = " key-int-max=" + std::to_string(keyint);
     if (enc == "h264" || enc == "x264" || enc == "x264enc") {
-        return "x264enc name=enc" + bit +
-               " key-int-max=" + std::to_string(keyint) +
-               " tune=zerolatency speed-preset=veryfast bframes=0";
+        return "x264enc name=enc" + bit + ki +
+               " tune=zerolatency speed-preset=veryfast bframes=0"
+               " repeat-sequence-header=true";
     }
     // NVIDIA NVENC: zerolatency disables B-frame reorder; rc-lookahead=0 drops
     // the lookahead window; repeat-sequence-header keeps every IDR self-contained
     // so a reconnect (auto-resume) does not wait for the next keyframe.
+    // GOP is set via "gop-size" (NOT key-int-max) - this is the fix for the
+    // multi-second WebRTC first-frame delay on NVENC.
     if (enc.rfind("nv", 0) == 0) {
         return enc + " name=enc" + bit +
+               " gop-size=" + std::to_string(keyint) +
                " tune=ultra-low-latency zerolatency=true bframes=0"
                " rc-lookahead=0 repeat-sequence-header=true";
     }
     // Intel MFX.
     if (enc.rfind("mfx", 0) == 0) {
-        return enc + " name=enc" + bit +
+        return enc + " name=enc" + bit + ki +
                " tune=low-latency bframes=0 rc-lookahead=0"
                " repeat-sequence-header=true";
     }
@@ -99,6 +107,26 @@ std::string pick_encoder() {
 }
 
 } // namespace
+
+// Clamp helper used below.
+static int clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// Maximum keyint we will ever apply (frames). Only a safety bound; the real
+// value is the negotiated framerate (=> ~1s GOP).
+constexpr int kMaxKeyint = 300;
+
+// Auto bitrate for a negotiated native format (auto_res mode). Scales with
+// pixel throughput so 1080p@30 gets materially more headroom than 240x240,
+// while staying within sane bounds. ~0.07 bit/pixel is a good H264 baseline at
+// the veryfast preset.
+static int auto_bitrate(int w, int h, int fps) {
+    if (w <= 0 || h <= 0 || fps <= 0) return 2000;
+    double px = double(w) * double(h) * double(fps);
+    int kb = int(px * 0.07 / 1000.0);
+    if (kb < 800)   kb = 800;
+    if (kb > 12000) kb = 12000;
+    return kb;
+}
 
 // ---- Latency instrumentation (opt-in via PipelineParams.measure_latency) ----
 // Each frame's buffer is stamped with the wall-clock moment it passes three
@@ -186,6 +214,14 @@ public:
     ~GstVideoPipeline() override { stop(); }
 
     bool build(const PipelineParams& p, const std::string& rtsp_url) override {
+        // Remember the params so a low-latency GOP correction can rebuild with
+        // adjusted keyint/bitrate after the real framerate is known.
+        pp_ = p;
+        auto_res_ = p.auto_res;
+        built_keyint_ = p.keyframe_interval;
+        rtsp_url_ = rtsp_url;
+        keyint_corrected_ = false;
+
         // ---- Required element checks (clear error, no crash) ----
         const std::string src = source_element(p.source);
         const std::string enc_elem = (p.encoder == "h264" || p.encoder == "x264")
@@ -319,6 +355,31 @@ public:
             return false;
         }
         query_negotiated();
+
+        // Live sources finalize caps a moment after PLAYING; wait (bounded) so
+        // we can read the real framerate before deciding the GOP. Avoids a
+        // false "unknown fps" that would skip the low-latency correction.
+        for (int i = 0; i < 30 && !neg_valid_; ++i) {
+            g_usleep(100000); // 100 ms
+            query_negotiated();
+        }
+
+        // Low-latency GOP correction (auto_res only). The configured keyint is
+        // expressed in FRAMES; at the camera's native (often low) framerate 30
+        // frames can mean several seconds, forcing the WebRTC player to wait
+        // that long for the first IDR. Once we know the negotiated fps we
+        // rebuild ONCE with keyint = ~1 second of frames, so the player starts
+        // within ~1s regardless of the source framerate. Bitrate is also
+        // re-derived from the negotiated native resolution in auto_res mode.
+        if (auto_res_ && neg_valid_ && neg_fps_ > 0 && !keyint_corrected_) {
+            const int desired = clamp_int(neg_fps_, 1, kMaxKeyint);
+            if (desired != built_keyint_) {
+                keyint_corrected_ = true;
+                CA_LOG_INFO("Negotiated {}fps ({}x{}); rebuilding with keyint={} for "
+                            "<=1s GOP (was {})", neg_fps_, neg_w_, neg_h_, desired, built_keyint_);
+                rebuild_with_keyint(desired);
+            }
+        }
         return true;
     }
 
@@ -330,7 +391,9 @@ public:
         if (bus_thread_.joinable()) bus_thread_.join();
         if (bus_) { gst_object_unref(bus_); bus_ = nullptr; }
         if (pipeline_) { gst_object_unref(pipeline_); pipeline_ = nullptr; }
-        set_status(StreamStatus::DISCONNECTED);
+        // Suppress the transient DISCONNECTED while we are mid GOP-correction
+        // rebuild, otherwise the StreamController would start a reconnect loop.
+        if (!rebuilding_) set_status(StreamStatus::DISCONNECTED);
     }
 
     Statistics get_stats() const override {
@@ -371,6 +434,39 @@ private:
     void set_status(StreamStatus s) {
         status_ = s;
         if (cb_) cb_(s);
+    }
+
+    // Rebuild the pipeline with a corrected keyint (and, in auto_res mode, a
+    // bitrate re-derived from the negotiated native format). Used once at
+    // startup to enforce a <=1s GOP. The rebuilding_ flag suppresses the
+    // transient DISCONNECTED status so the StreamController's reconnect loop is
+    // not wrongly triggered.
+    void rebuild_with_keyint(int desired) {
+        rebuilding_ = true;
+        stop();
+        rebuilding_ = false;
+
+        pp_.keyframe_interval = desired;
+        if (auto_res_) {
+            pp_.bitrate = auto_bitrate(neg_w_, neg_h_, neg_fps_);
+            CA_LOG_INFO("auto_res bitrate set to {}kbps for {}x{}@{}fps",
+                        pp_.bitrate, neg_w_, neg_h_, neg_fps_);
+        }
+
+        if (!build(pp_, rtsp_url_)) {
+            CA_LOG_ERROR("GOP correction: rebuild failed");
+            set_status(StreamStatus::ERROR);
+            return;
+        }
+        set_status(StreamStatus::CONNECTING);
+        const GstStateChangeReturn r =
+            gst_element_set_state(pipeline_, GST_STATE_PLAYING);
+        if (r == GST_STATE_CHANGE_FAILURE) {
+            CA_LOG_ERROR("GOP correction: failed to set PLAYING");
+            set_status(StreamStatus::ERROR);
+            return;
+        }
+        query_negotiated();
     }
 
     // Read the actually-negotiated capture format and log it. In auto_res mode
@@ -461,12 +557,12 @@ private:
                 CA_LOG_ERROR("GStreamer error: {} ({})", e ? e->message : "?", dbg ? dbg : "");
                 if (e) g_error_free(e);
                 if (dbg) g_free(dbg);
-                set_status(StreamStatus::DISCONNECTED); // trigger reconnect in Phase 6
+                if (!rebuilding_) set_status(StreamStatus::DISCONNECTED); // trigger reconnect in Phase 6
                 break;
             }
             case GST_MESSAGE_EOS:
                 CA_LOG_WARN("End of stream (server closed?)");
-                set_status(StreamStatus::DISCONNECTED);
+                if (!rebuilding_) set_status(StreamStatus::DISCONNECTED);
                 break;
             case GST_MESSAGE_STATE_CHANGED: {
                 if (GST_MESSAGE_SRC(msg) == GST_OBJECT(pipeline_)) {
@@ -495,6 +591,18 @@ private:
     std::atomic<StreamStatus> status_{StreamStatus::DISCONNECTED};
     StatusCallback cb_;
     std::string   missing_;
+
+    // Build params cached so the GOP-correction rebuild can reuse them with an
+    // adjusted keyint/bitrate.
+    PipelineParams pp_{};
+    std::string   rtsp_url_;
+    bool          auto_res_ = false;
+    int           built_keyint_ = 0;
+    bool          keyint_corrected_ = false;
+    // True while the one-time GOP-correction rebuild is in flight; suppresses
+    // the transient DISCONNECTED status that would otherwise fire the reconnect
+    // loop.
+    bool          rebuilding_ = false;
 
     bool         measure_latency_ = false;
     LatencyTracker lat_;

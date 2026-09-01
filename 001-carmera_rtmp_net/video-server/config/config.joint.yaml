@@ -1,0 +1,47 @@
+# Video Server configuration for the JOINT run with carmera-agent.
+#
+# Same schema as config.yaml - the only difference is the port block and the
+# database file, so the joint demo never collides with a standalone server
+# (or with other software on this machine) already holding the defaults.
+#
+# Why http_port is 8081 and not 8080:
+#   Port 8080 on this machine is grabbed by "ApplicationWebServer". If it wins
+#   the race, the server cannot bind and the joint run looks broken for no
+#   reason. 8081 is free. If it ever gets taken too, change the number here -
+#   every port lives in this file, none are hardcoded in the source.
+#
+# Ports in use by the joint run:
+#   8081  HTTP      REST API + embedded Web UI
+#   8554  RTSP      where camera-agent pushes, and where players pull from
+#   9997  HTTP      MediaMTX control API (polled by the server's monitor)
+#   8889  HTTP      MediaMTX WebRTC (WHEP signaling, proxied by the server)
+#   8888  HTTP      MediaMTX HLS (optional)
+
+server:
+  host: localhost
+  http_port: 8081
+
+rtsp:
+  port: 8554
+
+webrtc:
+  port: 8889
+
+database:
+  path: data/video.joint.db
+
+mediamtx:
+  # Local dev override: the MediaMTX binary installed on this machine.
+  # On a fresh clone, point this at your own mediamtx(.exe).
+  binary: D:/data/agent-tools/mediamtx_v1.20.1_windows_amd64/mediamtx.exe
+  # Runtime generated config (unique temp name inside this directory).
+  config: ./data/mediamtx.yml
+  # MediaMTX control API port - the server's monitor polls this to discover
+  # cameras. This is the reason the joint run must NOT start a second
+  # MediaMTX: only this instance exposes the API.
+  api_port: 9997
+  hls_port: 8888
+
+log:
+  level: info
+  # file: data/video-server.log   # optional; logs go to stdout if omitted

@@ -58,10 +58,14 @@ video-server/
 ├── web/                         # Vue3 前端（需 npm build 产出 dist/）
 │   └── dist/                    # 构建产物（被 Go embed）
 ├── config/config.yaml          # 主配置（端口单一来源）
+├── config/config.joint.yaml    # 联合运行配置（HTTP 移到 8081，避开 8080 冲突）
 ├── scripts/
 │   ├── build.bat               # 一键构建（前端 + 后端）
 │   ├── test-stream.bat         # 单路测试推流（需本地 ffmpeg）
-│   └── verify_e2e.py           # 端到端验收（PASS/FAIL 计数）
+│   ├── verify_e2e.py           # 端到端验收（ffmpeg 合成流，PASS/FAIL 计数）
+│   ├── start-joint.bat         # 联合运行：一键拉起 server + camera-agent
+│   ├── stop-joint.bat          # 联合运行：停掉全部进程
+│   └── verify_joint.py         # 联合运行验收（真实推流端，PASS/FAIL 计数）
 ├── data/                       # 运行时态（DB / 临时 MediaMTX 配置 / 日志）—— 不提交
 ├── go.mod / go.sum
 └── README.md
@@ -156,7 +160,135 @@ Ctrl+C 优雅退出（先停 HTTP，再停 MediaMTX 并清理临时配置）。
 
 ---
 
-## 7. 验证（端到端验收）
+## 7. 联合运行（video-server + carmera-agent）
+
+把 C++ 摄像头 Agent（`../carmera-agent`）与本项目跑成一条完整链路：
+
+```
+UVC 摄像头
+  └─ camera-agent.exe     GStreamer 采集 → H264 编码 → rtspclientsink
+       └─(RTSP push)──▶ MediaMTX :8554        ← 由 video-server 拉起
+                          └─ monitor（3s 轮询控制 API）自动注册摄像头
+                              └─ REST API / Web UI :8081（WebRTC / HLS 播放）
+```
+
+### 7.1 只有一个 MediaMTX —— 联合运行的核心约束
+
+`video-server` 启动时会**自己拉起** MediaMTX 子进程，且**只有这一个实例**开启了控制
+API（`:9997`）；monitor 正是靠它每 3s 轮询 `/v3/paths/list` 来发现摄像头。
+
+`carmera-agent` 目录里也有自己的 `mediamtx.yml` 与 `start-camera-agent.bat`，
+**联合运行时不要执行它们** —— 那会起第二个 MediaMTX 抢 `:8554`，而且它没有控制 API，
+服务器根本看不到那路流。正确做法是直接启动 `camera-agent.exe`，让它推到服务器那个
+MediaMTX 上。
+
+### 7.2 一键启动
+
+```bat
+scripts\start-joint.bat                  :: 起服务 + 起推流 + 自动开浏览器
+scripts\start-joint.bat --no-browser     :: 不开浏览器
+scripts\start-joint.bat --camera 0 --stream cam01
+scripts\stop-joint.bat                   :: 停掉全部（含 MediaMTX 子进程）
+```
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `VS_CONFIG` | `config.joint.yaml` | 服务器配置文件名 |
+| `CAMERA_ID` | 自动（`--list` 枚举后取第一个可用） | 摄像头索引 |
+| `STREAM_ID` | `camera01` | RTSP 路径名 |
+| `CAMERA_SOURCE` | 自动 | 强制 GStreamer 源（mfvideosrc / dshowvideosrc …） |
+| `NO_BROWSER` | `0` | `1` = 不开浏览器 |
+
+> **必须带 `--auto`**：本机 UVC 摄像头原生只支持 **240×240@8fps**，若强制
+> 1280×720@30 会导致 caps 协商失败、流水线进不了 PLAYING、Agent 陷入重连死循环。
+> 两个启动脚本均已默认加上。
+
+### 7.3 端到端验收
+
+```bash
+python scripts/verify_joint.py
+python scripts/verify_joint.py --stream camera01 --keep   # --keep: 结束时不杀进程，便于人工查看
+```
+
+与 `verify_e2e.py`（用 ffmpeg 推**合成**流）不同，本脚本驱动的是**真实推流端**
+（C++ camera-agent + GStreamer），断言整条链路：
+
+| 检查 | 含义 |
+|---|---|
+| `camera-agent enumerates at least one camera` | Agent 能枚举摄像头（GStreamer 后端可用） |
+| `server /api/health` / `database` / `mediamtx control API` | 服务三态正常 |
+| `camera-agent reached STREAMING` | 真实采集链路建立（日志出现 STREAMING） |
+| `stream auto-registered` / `reports online` | monitor 从 MediaMTX 自动注册并置在线 |
+| `rtsp playback camera01` | ffprobe 在 RTSP 上解出 h264 |
+| `negotiated resolution propagated to API` | Agent 协商的分辨率经 MediaMTX track 传到 API |
+| `API resolution matches decoded stream` | API 分辨率与 ffprobe 实测一致 |
+| `webrtc signaling` | WHEP 端点可达（合成 SDP 返回 400/502 属 INFO，完整协商需真实浏览器） |
+
+当前实测：**PASS=11 FAIL=0 INFO=2**（240×240 @ 8fps）。
+
+> `resolution` 的来源是 MediaMTX 控制 API 的 `tracks2[].codecProps`。RTSP 推流端不会
+> 主动上报规格，所以 monitor 在自动注册时会把它回写进 `cameras` 表；未知时保持原值，
+> 不会把已有数据清空。
+
+### 7.4 适配不同分辨率 / 帧率的摄像头（720p@30 / 720p@60 / 1080p@30 …）
+
+链路对摄像头规格是**自适应的**，换摄像头无需改代码：
+
+- **`--auto`（默认）是最稳的路径**：Agent 不强制 caps，由摄像头与 GStreamer 协商出
+  原生格式。换上 720p@30、720p@60、1080p@30 的摄像头，它直接协商对应规格，
+  MediaMTX 把真实宽高回传给服务器（已实测 240×240@8fps 原生摄像头可跑通）。
+- **强制指定规格**：带 `--width/--height/--fps` 且**不带** `--auto`，例如
+  `camera-agent.exe --width 1280 --height 720 --fps 60 --stream camera01 ...`。
+  适用于想锁定某档输出的场景；前提是摄像头支持该规格（否则 caps 协商失败进重连）。
+
+**GOP / 首帧延迟自适应（修复"开流要等约 5s 才出画面"）**
+
+编码器的 GOP 属性单位是**帧**（不是秒）。若按固定 30 帧，在 8fps 摄像头上意味着
+约 3.75s 才出一个关键帧，WebRTC 播放端必须等下一个 IDR 才能出首帧 → 体感 ~5s。
+Agent 在 `auto_res` 下拿到真实协商帧率后会**一次性重建管线**，把
+`keyint` 设为「≈1 秒的帧数」（如 8fps→8、30fps→30、60fps→60），无论源帧率多少，
+播放端都在 ~1s 内出首帧。日志可见
+`Negotiated Nfps (WxH); rebuilding with keyint=N for <=1s GOP`。
+
+> ⚠️ **不同编码器的 GOP 属性名不同**：`x264enc` / `mfxh264enc` 用 `key-int-max`，
+> 但本机默认走 **`nvh264enc`（NVIDIA NVENC）**，其属性是 **`gop-size`**（已用
+> `gst-inspect-1.0 nvh264enc` 确认）。`encoder_element()` 必须按后端用对名字，
+> 否则 GOP 校正被**静默丢弃**，NVENC 退回默认 GOP（~7-8s）→ WebRTC 首帧 4-5s 且无报错。
+> 改 GOP 前先 `gst-inspect-1.0 <enc>` 确认属性名。
+
+**码率自适应**
+
+`auto_res` 下 Agent 按协商出的原生「宽×高×帧率」自动估算码率（约 0.07 bit/像素，
+下限 800kbps、上限 12000kbps）：1080p@30 约 6000kbps、720p@30 约 2000kbps、
+240×240@8 约 800kbps。显式模式（`--width/--height/--fps` 不带 `--auto`）沿用配置值
+（默认 4000kbps）；高分辨率建议显式加 `--bitrate`，例如 1080p@30 给 `--bitrate 6000`。
+
+**帧率 / 码率显示**
+
+MediaMTX 控制 API 只暴露宽高，**不暴露帧率**。因此：
+
+- **fps**：服务器 monitor 另起节流（每 120s 最多一次）的 `ffprobe` 探测 RTSP 流，
+  取 `avg_frame_rate` 回填；环境需有 `ffprobe`（已在 PATH）。
+- **bitrate**：服务器用 MediaMTX 的 `bytesReceived` 累计值做跨扫描增量算出。
+- 两者均为「0 不覆盖」：探测/采样未就绪前保持原值，不会把已有数据清空。
+  Web UI 上 fps/bitrate 为空属正常过渡态，几秒后即有值。
+
+### 7.5 端口表（联合运行）
+
+| 端口 | 进程 | 用途 |
+|---|---|---|
+| `8081` | video-server | REST API + 嵌入式 Web UI |
+| `8554` | MediaMTX（video-server 子进程） | RTSP：Agent 推入、播放器拉出 |
+| `9997` | MediaMTX | 控制 API，服务器 monitor 轮询 |
+| `8889` | MediaMTX | WebRTC（WHEP 信令，由服务器代理） |
+| `8888` | MediaMTX | HLS（可选） |
+
+> 默认走 `config/config.joint.yaml` 而**不是** `config.yaml`：本机 `:8080` 会被
+> `ApplicationWebServer` 抢占，改用 8081 后演示不会再随机起不来。
+
+---
+
+## 8. 验证（端到端验收）
 
 `scripts/verify_e2e.py` 用 Python 标准库实现（无第三方依赖），方法论对齐 SOC `soc-camera-rtsp-agent`：
 
@@ -194,7 +326,7 @@ scripts\test-stream.bat camera01
 
 ---
 
-## 8. REST API 参考
+## 9. REST API 参考
 
 基址 `http://<host>:<http_port>`。
 
@@ -214,7 +346,7 @@ scripts\test-stream.bat camera01
 
 ---
 
-## 9. 调试与排错
+## 10. 调试与排错
 
 | 现象 | 原因 / 修复 |
 |---|---|
@@ -226,12 +358,16 @@ scripts\test-stream.bat camera01
 | 摄像头不自动出现 | 推流名需匹配；ffmpeg 建议 `-rtsp_transport tcp`；monitor 每 3s 扫描、10s 无数据转 offline，等几秒再看 `/api/cameras` |
 | WebRTC 返回 502 / 400 | 合成 SDP offer 不被 MediaMTX 接受属正常（INFO）。完整协商请用真实浏览器客户端走 `/api/cameras/{id}/webrtc` |
 | 端口被占用（如 `:8080` / `:9997`） | 本机 `:8080` 可能已被 `ApplicationWebServer`、`:9997` 被 `vivoSyncService` 等占用。在 `config.yaml` 改端口即可 |
+| **联合运行**：摄像头一直不出现 | 多半起了**两个** MediaMTX。只保留 `video-server` 拉起的那个（带 `:9997` 控制 API）；不要执行 `carmera-agent\start-camera-agent.bat`，它起的实例没有 API，服务器看不见 |
+| **联合运行**：Agent 反复重连、进不了 PLAYING | 未加 `--auto`。强制 1280×720@30 而摄像头只有 240×240@8fps → caps 协商失败。见 `soc-camera-rtsp-agent` 第五节 |
+| **联合运行**：`resolution` 为空 | MediaMTX 还没解析出 track 属性，等一轮 monitor（3s）；持续为空则查 `/v3/paths/list` 的 `tracks2` |
+| **联合运行**：`.bat` 起的进程随终端一起退出 | 脚本用 `start` 开独立窗口；在某些非交互 shell（如被回收的自动化会话）里子窗口会被连带清理。双击运行或在普通终端里执行 |
 | 首次构建极慢 | `modernc.org/sqlite` 转译库首次编译约 8 分钟，属正常，缓存命中后约 1 分钟 |
 | 构建/拉取模块失败（代理/网络） | 设 `GOPROXY=https://goproxy.cn,direct`；CI 可用 `go build -mod=readonly` 防止改写 `go.mod/go.sum` |
 
 ---
 
-## 10. 典型工作流（开发 → 验收）
+## 11. 典型工作流（开发 → 验收）
 
 ```bash
 # 1) 改代码后重新构建
@@ -254,7 +390,7 @@ python3 scripts/verify_e2e.py --binary video-server.exe
 
 ---
 
-## 11. 提交注意（`.gitignore` 建议）
+## 12. 提交注意（`.gitignore` 建议）
 
 `data/` 为运行时态，建议忽略：
 ```
