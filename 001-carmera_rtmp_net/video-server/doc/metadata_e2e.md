@@ -110,7 +110,7 @@ python scripts/verify_ai_resilience.py  # spec §22 测试5/6（AI 异常 / AI �
 | 脚本 | 结果 | 覆盖 |
 |---|---|---|
 | `verify_metadata.py` | **PASS=35 FAIL=0** | 接入 / 往返保真 / 心跳 / bbox 硬化 / 空结果 / 畸形拒绝 / 旧版兼容 / camera_id 映射 / 概览 / 5msg-s 压测 / 媒体路径不受影响 |
-| `verify_joint.py` | **PASS=17 FAIL=0 INFO=2** | 全栈协商 1280×720@30、RTSP 解码、分辨率/fps/码率回传、frame+status 双落库（WebRTC 502 为预期 INFO） |
+| `verify_joint.py` | **PASS=17 FAIL=0 INFO=3** | 全栈协商 1280×720@30、RTSP 解码、分辨率/fps/码率回传、frame+status 双落库；stage 6b 额外轮询真实检测帧并校验 objects 的 class/confidence/bbox 在帧内结构（无目标时为 INFO，不误判）（WebRTC 502 为预期 INFO） |
 | `verify_ai_resilience.py` | **PASS=24 FAIL=0 INFO=3** | §22 测试5（坏模型→视频 STREAMING+H264+fps=30+心跳 enable=true/running=false）/ 测试6（`--no-ai`→视频正常+心跳 enable=false/running=false）/ 测试7（杀服务→agent 存活+重连→重启后 metadata 自动恢复且 `frame_id` 越断点 48→50） |
 
 **合计 76 PASS / 0 FAIL。** spec §22 六类验收（测试1 全正常 / 2 服务关重连 / 3 网络断不崩 / 4 恢复发送 / 5 AI 异常 / 6 AI 关闭）全部真机通过。

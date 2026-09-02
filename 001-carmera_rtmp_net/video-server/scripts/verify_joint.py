@@ -474,6 +474,58 @@ def main():
                 check("metadata frame present", True,
                       f"frame_id={frame.get('frame_id')} "
                       f"{frame.get('video_width')}x{frame.get('video_height')}")
+                # Real detection round-trip: poll up to 20s for a frame that
+                # actually carries detections (needs a target in front of the
+                # camera). Empty frames are valid, so a miss is INFO not FAIL.
+                # This closes the loop from synthetic bbox hardening
+                # (verify_metadata) to REAL YOLO output produced by the live
+                # camera-agent landing in the server snapshot.
+                def frame_with_objs():
+                    f = (meta_snapshot() or {}).get("frame")
+                    if isinstance(f, dict) and isinstance(f.get("objects"), list) \
+                            and len(f["objects"]) > 0:
+                        return f
+                    return None
+                det_frame = wait_for(frame_with_objs, timeout=20, interval=2.0)
+                if isinstance(det_frame, dict) and det_frame.get("objects"):
+                    objs = det_frame["objects"]
+                    w = det_frame.get("video_width") or 0
+                    h = det_frame.get("video_height") or 0
+                    count = det_frame.get("object_count")
+                    if isinstance(count, int) and count > 0:
+                        check("detected object_count matches payload",
+                              count == len(objs), f"object_count={count} len={len(objs)}")
+                    bad = []
+                    classes = []
+                    for o in objs:
+                        if not isinstance(o, dict):
+                            bad.append("not-an-object")
+                            continue
+                        c = o.get("class")
+                        conf = o.get("confidence")
+                        bx = o.get("bbox")
+                        classes.append(str(c))
+                        if not c:
+                            bad.append("empty-class")
+                        if not (isinstance(conf, (int, float)) and 0.0 <= conf <= 1.0):
+                            bad.append("bad-confidence")
+                        if not (isinstance(bx, (list, tuple)) and len(bx) == 4
+                                and all(isinstance(v, int) for v in bx)):
+                            bad.append("bad-bbox-shape")
+                        elif w > 0 and h > 0:
+                            x1, y1, x2, y2 = bx
+                            if not (0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h):
+                                bad.append(f"bbox-out-of-frame {bx}")
+                    if bad:
+                        check("real detections well-formed (class/conf/bbox in-frame)",
+                              False, "; ".join(bad[:5]))
+                    else:
+                        check("real detections well-formed (class/conf/bbox in-frame)",
+                              True, f"{len(objs)} object(s): {', '.join(classes)}")
+                    info("detected classes", ", ".join(classes) if classes else "(none this frame)")
+                else:
+                    info("no detections observed in window",
+                         "no target in front of camera, or AI still warming up")
             else:
                 info("metadata frame not yet present",
                      "status heartbeat arrived; frame needs the AI model + a few seconds")
