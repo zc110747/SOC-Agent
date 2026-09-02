@@ -19,5 +19,8 @@ web/dist/
 push_pids.txt
 _go_versions.json
 
+# Python bytecode cache (verify scripts compiled via py_compile)
+scripts/__pycache__/
+
 # Logs
 *.log

@@ -5,7 +5,7 @@
 > 与 camera-agent 侧互为镜像，共同构成 spec §20 的完整数据流。
 >
 > 配套源码：`internal/metadata/{model.go,repo.go,metadata_test.go}`、`internal/api/metadata.go`、`internal/api/handlers.go`。
-> 验收脚本：`scripts/verify_metadata.py`、`scripts/verify_joint.py`、`scripts/verify_ai_resilience.py`。
+> 验收脚本：`scripts/verify_metadata.py`、`scripts/verify_joint.py`、`scripts/verify_ai_resilience.py`、`scripts/verify_metadata_https.py`。
 
 ---
 
@@ -71,7 +71,7 @@ Camera (UVC)
 | # | 交付物 | 服务端实现 |
 |---|---|---|
 | 1 | 修改文件 | `internal/api/metadata.go`（新增接收端点）、`internal/api/handlers.go`、`internal/api/router.go`、`internal/server/server.go`、`internal/config/config.go`、`internal/database/db.go`、`cmd/video-server/main.go` |
-| 2 | 新增文件 | `internal/metadata/model.go`、`internal/metadata/repo.go`、`internal/metadata/metadata_test.go`、`scripts/verify_metadata.py`、`scripts/verify_joint.py`、`scripts/verify_ai_resilience.py` |
+| 2 | 新增文件 | `internal/metadata/model.go`、`internal/metadata/repo.go`、`internal/metadata/metadata_test.go`、`scripts/verify_metadata.py`、`scripts/verify_joint.py`、`scripts/verify_ai_resilience.py`、`scripts/verify_metadata_https.py` |
 | 3 | Metadata 协议 | 见 §2：`POST /api/metadata`，`type ∈ {frame,status}`，`version` 字段必备；旧版无 `type` 由 `InferType()` 按载荷形状兜底（§10.5） |
 | 4 | Transport 实现 | 服务端侧 Transport = HTTP `POST /api/metadata` + JSON 解码 + `type` 路由；agent 侧为 `HttpMetadataTransport`（WinHTTP）。协议契约统一，互不依赖实现细节 |
 | 5 | Queue 设计 | 服务端不维护发送队列，而是**有界落库**：`ai_object` 按 `retention_rows`（默认 2000/路）滚动裁剪，`ai_frame` 仅留最新一帧。与 agent 侧有界队列（默认 8，丢最老保最新）解耦，断服时 agent 队列不膨胀 |
@@ -102,7 +102,8 @@ Camera (UVC)
 cd video-server
 python scripts/verify_metadata.py       # 服务端 metadata 接入（独立起服务）
 python scripts/verify_joint.py          # 全栈：真实 camera-agent --auto --ai --metadata
-python scripts/verify_ai_resilience.py  # spec §22 测试5/6（AI 异常 / AI 关闭）
+python scripts/verify_ai_resilience.py  # spec §22 测试5/6/7（AI 异常 / AI 关闭 / 杀服务重连）
+python scripts/verify_metadata_https.py # HTTPS TLS 双态验收（--metadata-insecure 开/关）
 ```
 
 实测（2026-09-02，对齐 HEAD 的二进制）：
@@ -112,8 +113,9 @@ python scripts/verify_ai_resilience.py  # spec §22 测试5/6（AI 异常 / AI �
 | `verify_metadata.py` | **PASS=35 FAIL=0** | 接入 / 往返保真 / 心跳 / bbox 硬化 / 空结果 / 畸形拒绝 / 旧版兼容 / camera_id 映射 / 概览 / 5msg-s 压测 / 媒体路径不受影响 |
 | `verify_joint.py` | **PASS=17 FAIL=0 INFO=3** | 全栈协商 1280×720@30、RTSP 解码、分辨率/fps/码率回传、frame+status 双落库；stage 6b 额外轮询真实检测帧并校验 objects 的 class/confidence/bbox 在帧内结构（无目标时为 INFO，不误判）（WebRTC 502 为预期 INFO） |
 | `verify_ai_resilience.py` | **PASS=24 FAIL=0 INFO=3** | §22 测试5（坏模型→视频 STREAMING+H264+fps=30+心跳 enable=true/running=false）/ 测试6（`--no-ai`→视频正常+心跳 enable=false/running=false）/ 测试7（杀服务→agent 存活+重连→重启后 metadata 自动恢复且 `frame_id` 越断点 48→50） |
+| `verify_metadata_https.py` | **PASS=4 FAIL=0 INFO=2** | §13 对齐的 TLS 双态：Run A（`--metadata-insecure` 开）→ 真实 agent 对自签 HTTPS 端点成功 POST（11 条 frame/status 落 mock 204）；Run B（默认）→ WinHTTP 证书链校验**拦截**自签证书（0 POST 到达），agent 存活不崩，安全默认保留 |
 
-**合计 76 PASS / 0 FAIL。** spec §22 六类验收（测试1 全正常 / 2 服务关重连 / 3 网络断不崩 / 4 恢复发送 / 5 AI 异常 / 6 AI 关闭）全部真机通过。
+**合计 80 PASS / 0 FAIL。** spec §22 六类验收（测试1 全正常 / 2 服务关重连 / 3 网络断不崩 / 4 恢复发送 / 5 AI 异常 / 6 AI 关闭）全部真机通过；HTTPS TLS 开关（spec §13 隐含的传输安全项）双态真机闭环。
 
 ---
 
