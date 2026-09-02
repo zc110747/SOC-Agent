@@ -125,6 +125,13 @@ export class StreamPlayer {
   private async connectWebRTC(): Promise<void> {
     if (this.closed) return
     this.transport = 'webrtc'
+    // Start from a clean <video>: drop any HLS blob src / stale srcObject so
+    // the WebRTC stream we assign on ontrack is the only thing driving it.
+    if (this.video.src) {
+      this.video.removeAttribute('src')
+      this.video.load()
+    }
+    this.video.srcObject = null
     this.detail = this.retry === 0 ? 'negotiating WebRTC' : 'retrying WebRTC #' + this.retry
     this.emit({ state: this.retry === 0 ? 'connecting' : 'reconnecting' })
 
@@ -229,6 +236,12 @@ export class StreamPlayer {
       }
       this.pc = null
     }
+    // Release the WebRTC MediaStream from the <video> element so a later
+    // HLS attach (or a re-attach of WebRTC) starts from a clean element.
+    // Without this, a leftover srcObject shadows the src hls.js drives with.
+    if (this.video.srcObject) {
+      this.video.srcObject = null
+    }
   }
 
   // ---------------------------------------------------------------------- hls
@@ -237,6 +250,11 @@ export class StreamPlayer {
     if (this.closed) return
     this.transport = 'hls'
     this.detail = 'loading HLS (HTTP fallback)'
+    // A <video> that still carries a WebRTC MediaStream in srcObject will
+    // ignore the src hls.js assigns it, so the HLS picture never shows
+    // (black rectangle, currentTime stuck at 0). Drop any stale stream
+    // before hls.js takes over the element.
+    this.video.srcObject = null
     this.emit({ state: 'fallback' })
 
     let url = '/hls/' + this.cameraId + '/index.m3u8'
@@ -250,7 +268,31 @@ export class StreamPlayer {
     }
 
     if (Hls.isSupported()) {
-      const hls = new Hls({ enableWorker: true, lowLatencyMode: true })
+      // The server now serves CLASSIC MPEG-TS HLS (hlsVariant: mpegts), not
+      // LL-HLS. lowLatencyMode is an LL-HLS-only client feature (it drives
+      // EXT-X-PART partial-segment fetching); enabling it against a classic
+      // .ts playlist is a misconfiguration and must stay off.
+      const hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        // ---- live low-latency tuning (measured on this server, 2026-09-02) --
+        // hls.js's default liveSyncDurationCount=3 parks the playhead ~3
+        // target-durations behind the live edge: ~2.5 s extra on 1 s segments,
+        // ~10 s on 4 s GOP segments. Syncing 1 segment ahead + catch-up
+        // playback keeps the HLS fallback ~0.5-2.5 s behind with zero stalls
+        // on LAN (probe A/B/C: default 2.4s / sync2 1.4s / sync1 0.5s @1s-GOP;
+        // 10.4s / - / 2.4s @4s-GOP). maxBufferLength is trimmed so the player
+        // does not re-buffer a long window on top of the sync point.
+        liveSyncDurationCount: 1,
+        liveMaxLatencyDurationCount: 6,
+        maxLiveSyncPlaybackRate: 2,
+        maxBufferLength: 8,
+        // HLS is the fallback path; be forgiving about transient segment
+        // gaps so a single slow segment does not blank the screen.
+        fragLoadingMaxRetry: 6,
+        manifestLoadingMaxRetry: 6,
+        levelLoadingMaxRetry: 6,
+      })
       this.hls = hls
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         this.detail = 'HLS playing (HTTP fallback)'
@@ -258,9 +300,23 @@ export class StreamPlayer {
         this.emit({ state: 'fallback' })
       })
       hls.on(Hls.Events.ERROR, (_e, data) => {
-        if (!data.fatal) return
+        if (!data.fatal) {
+          // Non-fatal: let hls.js retry internally, just surface it.
+          this.detail = 'HLS warn: ' + data.type + ' / ' + data.details
+          this.emit()
+          return
+        }
         this.detail = 'HLS error: ' + data.type + ' / ' + data.details
         this.emit({ state: 'disconnected' })
+        // Try to self-recover before tearing down and reloading.
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          hls.startLoad()
+          return
+        }
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          hls.recoverMediaError()
+          return
+        }
         this.scheduleHLSRetry(url)
       })
       hls.loadSource(url)
@@ -296,6 +352,10 @@ export class StreamPlayer {
     if (this.video.src) {
       this.video.removeAttribute('src')
       this.video.load()
+    }
+    // Symmetric cleanup: clear any srcObject so WebRTC can re-take the element.
+    if (this.video.srcObject) {
+      this.video.srcObject = null
     }
   }
 

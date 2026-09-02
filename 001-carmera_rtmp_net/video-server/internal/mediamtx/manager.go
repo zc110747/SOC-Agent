@@ -155,6 +155,7 @@ webrtcLocalUDPAddress: :%d
 webrtcLocalTCPAddress: :%d
 webrtcIPsFromInterfaces: true
 hls: true
+hlsVariant: mpegts
 hlsAddress: %s
 playback: false
 record: false

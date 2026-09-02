@@ -338,7 +338,11 @@ hlsAlwaysRemux: false
 # * mpegts - uses MPEG-TS segments, for maximum compatibility.
 # * fmp4 - uses fragmented MP4 segments, more efficient.
 # * lowLatency - uses Low-Latency HLS.
-hlsVariant: lowLatency
+# NOTE: this static file is NOT read at runtime - video-server generates its own
+# mediamtx config (internal/mediamtx/manager.go GenerateConfig) and pins
+# hlsVariant: mpegts there. Kept in sync (mpegts) only so this reference file is
+# not a trap for readers; do NOT rely on it for runtime behavior.
+hlsVariant: mpegts
 # Number of HLS segments to keep on the server.
 # Segments allow to seek through the stream.
 # Their number doesn't influence latency.

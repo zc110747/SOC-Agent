@@ -294,7 +294,7 @@ curl http://<任意本机IP>:8081/api/net/addresses
 - 同源：无 CORS、无混合内容，手机只需要开放 HTTP 这一个端口；
 - 纯 TCP：绕开 UDP 限制，也绕开 http 下 WebRTC 被拒的问题；
 - iOS Safari 原生支持 HLS，Android Chrome 由 hls.js 播放；
-- 代价是延迟从亚秒升到 2~6 秒，所以它只是兜底，不是首选。
+- 代价是延迟比 WebRTC 高一个量级（详见 6.3），所以它只是兜底，不是首选。
 
 播放器右上角可手动在 `WebRTC` / `HLS` 之间切换；左上角显示当前实际通道
 （`WEBRTC` 或 `HLS (fallback)`），下方一行显示失败原因 —— 手机端直接可见，不必开 devtools。
@@ -303,6 +303,36 @@ curl http://<任意本机IP>:8081/api/net/addresses
 ```bash
 curl http://<server-ip>:8081/hls/camera01/index.m3u8
 ```
+
+### 6.3 HLS 时延为什么高，以及已做的低延迟调优（2026-09-02）
+
+HLS 端到端时延 ≈ **发布端滞后** + **hls.js frontier gap**：
+
+1. **发布端滞后（~0.7s）**：服务端把流切成 1 秒的分段再写播放列表，播放器必须等整段生成完才拉，
+   天然含 ≤1 段边界等待。这是分段式 HLS 的固有代价，无法消除。
+2. **frontier gap（播放器刻意滞后）**：hls.js 默认 `liveSyncDurationCount=3`，播放头被放在播放列表
+   边缘之后 3 个分段处，纯属缓冲策略。这一项**之前是时延大头**，现已调低（见下）。
+
+**关键约束 —— 服务端分段时长被上游 GOP 钳制**：MediaMTX 只能在**关键帧（IDR）**处起新段。若推流端
+GOP=4s，服务端就出 4 秒的分段，frontier gap 会按 4 秒一级放大。**要让 HLS 时延可控，推流端 GOP 必须
+≈1s**（`camera-agent --auto` 已内置 keyint=fps 修正，自动保证 1 秒一个关键帧）。
+
+**前端低延迟参数（`web/src/webrtc/player.ts`）**：`liveSyncDurationCount:1`、
+`liveMaxLatencyDurationCount:6`、`maxLiveSyncPlaybackRate:2`（落后过多时快进追赶）、`maxBufferLength:8`。
+
+实测（`scripts/hls_latency_probe.js A|B|C`，chromium 注入 hls.js 读 level details）：
+
+| frontier gap | @1s GOP | @4s GOP |
+|---|---|---|
+| 默认（sync3，调优前） | ~2.4s | **~10s** |
+| sync2 + 追帧 1.5× | ~1.4s | – |
+| **sync1 + 追帧 2×（当前）** | ~0.5-1s | ~2.4s |
+
+真机（合成源 + 真实 App 点 HLS）发布端滞后中位 0.75s。**预期端到端 HLS 时延 ~2-3.5s**（浏览器侧
+贡献已从 ~2.4s 降到 ~0.5-1s）。WebRTC 为亚秒级 —— 若业务需要 <1s 的实时性，应走 WebRTC（或 LL-HLS），
+HLS 只作兼容兜底。iOS Safari 走原生播放器、无上述旋钮，缓冲更大属预期。
+
+延迟复测：`scripts/hls_latency_probe.js C`（需先起服务并推流，见 §8 的 ffmpeg 命令）。
 
 > 安全提示：MediaMTX 的**控制 API**（默认 `api_bind: 127.0.0.1:9997`）只对内监听 —— 它没有任何鉴权，暴露到局域网等于把每一路流的控制权交出去。媒体端口（RTSP/WebRTC/HLS）同理无鉴权，只在可信网络内开放。
 

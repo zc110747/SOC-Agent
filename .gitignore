@@ -11,6 +11,7 @@
 *.err
 finished
 logs
+nul
 
 # Linker output
 *.ilk

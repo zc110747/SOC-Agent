@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -71,17 +72,60 @@ def wait_for(predicate, timeout=40, interval=1.0, label="condition"):
     return last
 
 
+def _tcp_free(port, host="127.0.0.1"):
+    """True if nothing is listening on (host, port) right now."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(1)
+    try:
+        return s.connect_ex((host, port)) != 0
+    finally:
+        s.close()
+
+
+def _free_block(base, n, host="127.0.0.1", maxtries=400):
+    """Find a base port B such that B..B+n-1 are all free; returns B or None.
+
+    A contiguous free block lets us bind HTTP/RTSP/WebRTC/HLS/API/ICE without
+    colliding with a leftover MediaMTX (e.g. an orphan from a previous run that
+    still holds 8554/8888/8889/9997/8189) -- the exact trap that made the
+    synthetic e2e gate report a silent `null` for /api/cameras.
+    """
+    for b in range(base, base + maxtries):
+        if all(_tcp_free(p, host) for p in range(b, b + n)):
+            return b
+    return None
+
+
+def _patch_port(content, key_re, value, flags=0):
+    """Replace the port number following a key matched by `key_re`.
+
+    `key_re` must end in a capturing group for the key prefix, e.g.
+    r'(http_port:\\s*)'. The digits after it are replaced with `value`.
+    """
+    return re.sub(key_re + r"(\d+)", lambda m: m.group(1) + str(value), content, flags=flags)
+
+
 def main():
     ap = argparse.ArgumentParser()
     here = os.path.dirname(os.path.abspath(__file__))
     proj = os.path.dirname(here)
     ap.add_argument("--binary", default=os.path.join(proj, "video-server.exe"))
     ap.add_argument("--project-root", default=proj)
+    ap.add_argument("--config", default=None,
+                    help="server YAML (default: <project-root>/config/config.yaml)")
     ap.add_argument("--streams", type=int, default=3)
-    ap.add_argument("--host", default="localhost")
-    ap.add_argument("--http-port", type=int, default=8080)
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="loopback host for the e2e checks and the ffmpeg push. "
+                         "Use 127.0.0.1 (not 'localhost'): MediaMTX's RTSP listener "
+                         "is IPv4-only, and 'localhost' resolves to ::1 first on some "
+                         "hosts, so an ffmpeg push to rtsp://localhost:<port> never "
+                         "connects and the monitor sees zero publishers.")
+    ap.add_argument("--http-port", type=int, default=8080,
+                    help="HTTP port to BIND (patched into the generated config) and to check")
     ap.add_argument("--rtsp-port", type=int, default=8554)
     ap.add_argument("--no-webrtc", action="store_true")
+    ap.add_argument("--no-hls", action="store_true",
+                    help="skip the HLS playability stage (regression guard for the HLS black-screen fix)")
     args = ap.parse_args()
 
     base = f"http://{args.host}:{args.http_port}"
@@ -99,7 +143,6 @@ def main():
     print(f"== video-server e2e acceptance ==")
     print(f"   binary     : {args.binary}")
     print(f"   project    : {args.project_root}")
-    print(f"   base url   : {base}")
     print(f"   ffmpeg     : {ffmpeg}")
     print(f"   ffprobe    : {ffprobe}")
     print(f"   streams    : {args.streams}")
@@ -109,20 +152,58 @@ def main():
     # Generate a per-run config that points the SQLite DB at a brand-new file.
     # Some sandboxes forbid a subprocess from *writing* to a pre-existing file,
     # which surfaces as SQLITE_READONLY; a freshly-created DB file is writable.
-    base_cfg = os.path.join(args.project_root, "config", "config.yaml")
+    base_cfg = args.config or os.path.join(args.project_root, "config", "config.yaml")
     run_id = f"{os.getpid()}_{int(time.time()*1000)}"
     # Keep generated config under data/ (runtime state), not the source config/ dir.
     cfg = os.path.join(args.project_root, "data", f"e2e_{run_id}.yaml")
+
+    # Pick a contiguous block of FREE ports so the synthetic run never collides
+    # with a leftover MediaMTX (e.g. an orphan from a previous run still holding
+    # 8554/8888/8889/9997/8189) -- that collision silently broke
+    # auto-registration and produced a misleading /api/cameras `null`.
+    hint = args.http_port if args.http_port else 18080
+    block = _free_block(max(18080, hint), 6)
+    if block is None:
+        print("[FATAL] could not find 6 free TCP ports for the e2e run")
+        sys.exit(2)
+    http_port = block
+    rtsp_port = block + 1
+    webrtc_port = block + 2
+    hls_port = block + 3
+    api_port = block + 4
+    ice_port = block + 5
+
     try:
         with open(base_cfg, "r", encoding="utf-8") as f:
             content = f.read()
         db_path = f"data/video.e2e_{run_id}.db"
         content = re.sub(r"(path:\s*)data/video\.db", r"\1" + db_path, content)
+        # Pin every media port to the free block so bind == check and nothing
+        # collides with another process on the box.
+        content = _patch_port(content, r"(http_port:\s*)", http_port)
+        content = _patch_port(content, r"(rtsp:\s*\n\s*port:\s*)", rtsp_port, flags=re.DOTALL)
+        content = _patch_port(content, r"(webrtc:\s*\n\s*port:\s*)", webrtc_port, flags=re.DOTALL)
+        content = _patch_port(content, r"(hls_port:\s*)", hls_port)
+        content = _patch_port(content, r"(api_port:\s*)", api_port)
+        content = _patch_port(content, r"(ice_udp_port:\s*)", ice_port)
+        content = _patch_port(content, r"(ice_tcp_port:\s*)", ice_port)
+        # Run at debug so the monitor's auto-registration lines are visible if a
+        # check fails (the server log is tailed on failure).
+        content = re.sub(r"(level:\s*)\w+", r"\g<1>debug", content)
         with open(cfg, "w", encoding="utf-8") as f:
             f.write(content)
     except Exception as e:
         print(f"[FATAL] could not generate per-run config: {e}")
         sys.exit(2)
+
+    # Reflect the chosen ports back into args so the check URLs and the ffmpeg
+    # push target exactly what the server bound.
+    args.http_port = http_port
+    args.rtsp_port = rtsp_port
+    base = f"http://{args.host}:{args.http_port}"
+    rtsp_base = f"rtsp://{args.host}:{args.rtsp_port}"
+    print(f"[*] free port block: http={http_port} rtsp={rtsp_port} webrtc={webrtc_port}"
+          f" hls={hls_port} api={api_port} ice={ice_port}")
     # Unique per-run log: some sandboxes forbid overwriting a pre-existing file,
     # so embed the PID+time to guarantee a brand-new path each run.
     log_path = os.path.join(args.project_root, "data", f"verify_e2e_server_{run_id}.log")
@@ -135,6 +216,7 @@ def main():
         stderr=subprocess.STDOUT,
     )
     publishers = []
+    fflogs = []
 
     def cleanup():
         for p in publishers:
@@ -179,8 +261,15 @@ def main():
                 "-tune", "zerolatency", "-g", "30", "-keyint_min", "30",
                 "-rtsp_transport", "tcp", "-f", "rtsp", url,
             ]
-            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            fflog = os.path.join(
+                args.project_root, "data", f"verify_e2e_ffmpeg_{name}_{run_id}.log")
+            # Capture ffmpeg stderr to a file: a failed push is otherwise silent
+            # and shows up only as a mysterious /api/cameras `null`.
+            p = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL,
+                stderr=open(fflog, "w", encoding="utf-8", errors="replace"))
             publishers.append(p)
+            fflogs.append(fflog)
             print(f"    launched ffmpeg -> {url} (pid={p.pid})")
 
         # ---- wait for auto-registration ----
@@ -191,6 +280,21 @@ def main():
         )
         if isinstance(cam_res, Exception):
             check("cameras auto-registered from RTSP publishers", False, str(cam_res))
+            for fl in fflogs:
+                print(f"    | --- ffmpeg log {os.path.basename(fl)} ---")
+                _tail(fl, n=15)
+            # Ground truth while the server is still alive: ask MediaMTX's own
+            # control API what publishers it sees, and whether ffmpeg is still up.
+            try:
+                ml, _ = http_get_json(f"http://127.0.0.1:{api_port}/v3/paths/list")
+                items = ml.get("items", []) if isinstance(ml, dict) else []
+                print(f"    | mediamtx paths/list: {len(items)} path(s) -> "
+                      + ", ".join(f"{i.get('name')}(online={i.get('online')},"
+                                   f"source={i.get('source')})" for i in items) or "(none)")
+            except Exception as e:
+                print(f"    | mediamtx paths/list error: {e}")
+            alive = [p.pid for p in publishers if p.poll() is None]
+            print(f"    | ffmpeg publishers still alive: {alive or '(none)'}")
             _tail(log_path)
             cleanup()
             return _finish()
@@ -262,6 +366,13 @@ def main():
                 except Exception as e:
                     print(f"  [INFO] webrtc signaling {name} :: endpoint error {e}")
 
+        # ---- per-camera HLS playability (regression guard for the HLS black-screen fix) ----
+        if not args.no_hls:
+            print("[*] verifying HLS playability via proxy (mpegts, no EXT-X-GAP) ...")
+            for name in streams:
+                ok, detail = _hls_ok(base, name, timeout=20)
+                check(f"hls playback {name}", ok, detail)
+
     finally:
         cleanup()
 
@@ -294,6 +405,41 @@ def _ffprobe_ok(ffprobe, url, timeout=15):
         return False, "ffprobe timeout"
     except Exception as e:
         return False, str(e)
+
+
+def _hls_ok(base, name, timeout=20):
+    """Fetch the HLS playlist through the server proxy and assert it is a
+    classic MPEG-TS HLS (no LL-HLS GAP/parts) with a playable .ts segment.
+
+    Regression guard for the 'WebRTC works but HLS is black' bug: MediaMTX
+    defaulted to hlsVariant: lowLatency and served gap.mp4 as text/html, which
+    hls.js treated as a fatal error. manager.go now pins hlsVariant: mpegts, so
+    the proxy must hand back a standard .ts playlist with video/mp2t segments.
+    """
+    try:
+        idx_url = f"{base}/hls/{name}/index.m3u8"
+        with urllib.request.urlopen(idx_url, timeout=timeout) as r:
+            idx = r.read().decode("utf-8", "replace")
+        m = re.search(r"[^\s]+\.m3u8(?:\?[^\s]*)?", idx)
+        if not m:
+            return False, "no media playlist referenced by index.m3u8"
+        media_url = f"{base}/hls/{name}/{m.group(0)}"
+        with urllib.request.urlopen(media_url, timeout=timeout) as r:
+            media = r.read().decode("utf-8", "replace")
+        if "EXT-X-GAP" in media or "EXT-X-PART-INF" in media:
+            return False, "LL-HLS GAP/parts present (black-screen root cause)"
+        seg = re.search(r"[^\s]+\.ts(?:\?[^\s]*)?", media)
+        if not seg:
+            return False, "no .ts segment in media playlist"
+        seg_url = f"{base}/hls/{name}/{seg.group(0)}"
+        with urllib.request.urlopen(seg_url, timeout=timeout) as r:
+            ctype = r.headers.get("Content-Type", "")
+            head = r.read(4)
+        if "mp2t" not in ctype and head[:1] != b"\x47":
+            return False, f"segment not MPEG-TS (Content-Type={ctype})"
+        return True, f"mpegts, Content-Type={ctype}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 def _tail(path, n=25):
