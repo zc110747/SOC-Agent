@@ -639,6 +639,8 @@ python scripts/verify_metadata.py --base-url http://127.0.0.1:8081
 
 当前结果：**PASS=35 FAIL=0**。
 
+端到端方案（camera-agent → video-server 完整链路）与 spec §23 交付物映射见 [`doc/metadata_e2e.md`](doc/metadata_e2e.md)。
+
 ### 10.7 查询示例
 
 ```bash
