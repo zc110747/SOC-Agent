@@ -40,6 +40,46 @@ export interface StreamInfo {
   hls_direct_url?: string
 }
 
+// ---- AI metadata (boxes drawn on the video overlay) -------------------------
+
+export interface MetadataObject {
+  class: string
+  confidence: number
+  track_id: number
+  /** [x1, y1, x2, y2] in ORIGINAL video pixels. */
+  bbox: [number, number, number, number]
+}
+
+export interface MetadataFrame {
+  frame_id: number
+  timestamp: number
+  video_width: number
+  video_height: number
+  object_count: number
+  received_at: string
+  objects: MetadataObject[]
+}
+
+export interface MetadataStatus {
+  enable: boolean
+  running: boolean
+  fps: number
+  model: string
+  tracker: string
+  last_frame_id: number
+  last_timestamp: number
+  processed: number
+  wall_clock: number
+  received_at: string
+}
+
+/** Everything the overlay needs for one camera in a single call. */
+export interface MetadataSnapshot {
+  camera_id: string
+  frame?: MetadataFrame
+  status?: MetadataStatus
+}
+
 const BASE = '/api'
 
 async function getJSON<T>(path: string): Promise<T> {
@@ -68,5 +108,6 @@ export const api = {
   cameraStatus: (id: string) => getJSON<{ id: string; status: CameraStatus }>('/cameras/' + id + '/status'),
   cameraStream: (id: string) => getJSON<StreamInfo>('/cameras/' + id + '/stream'),
   webrtcOffer: (id: string, sdp: string) =>
-    sendJSON<{ type: string; sdp: string }>('/cameras/' + id + '/webrtc', 'POST', { sdp })
+    sendJSON<{ type: string; sdp: string }>('/cameras/' + id + '/webrtc', 'POST', { sdp }),
+  cameraMetadata: (id: string) => getJSON<MetadataSnapshot>('/cameras/' + id + '/metadata')
 }

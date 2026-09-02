@@ -2,6 +2,12 @@
   <div class="player-wrap">
     <video ref="videoEl" autoplay playsinline muted></video>
 
+    <!-- AI tracking-box overlay. Pointer-events disabled so the WebRTC / HLS /
+         fullscreen controls above stay clickable. The canvas is drawn from the
+         latest GET /api/cameras/{id}/metadata frame, scaled to the displayed
+         video size. -->
+    <canvas ref="canvasEl" class="box-overlay"></canvas>
+
     <!-- Autoplay can be refused on phones (low power / data saver). Without a
          visible affordance the symptom is just "a black rectangle". -->
     <button v-if="status.needsTap" class="tap-overlay" @click="player?.resume()">
@@ -11,6 +17,7 @@
     <div class="player-status">
       <span class="transport">{{ transportLabel }}</span>
       <span class="state">{{ stateText }}</span>
+      <span v-if="aiOn" class="ai-badge">AI {{ objectCount }}</span>
     </div>
 
     <div class="player-tools">
@@ -33,10 +40,13 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { FullScreen } from '@element-plus/icons-vue'
 import { StreamPlayer, type PlayerStatus } from '@/webrtc/player'
+import { api, type MetadataSnapshot } from '@/api/client'
 
 const props = defineProps<{ cameraId: string }>()
 const videoEl = ref<HTMLVideoElement | null>(null)
+const canvasEl = ref<HTMLCanvasElement | null>(null)
 let player: StreamPlayer | null = null
+let metaTimer: number | null = null
 
 const status = reactive<PlayerStatus>({
   state: 'idle',
@@ -44,6 +54,9 @@ const status = reactive<PlayerStatus>({
   detail: '',
   needsTap: false
 })
+
+const aiOn = ref(false)
+const objectCount = ref(0)
 
 const stateText = computed(() => {
   switch (status.state) {
@@ -74,6 +87,96 @@ function fullscreen() {
   videoEl.value?.requestFullscreen?.()
 }
 
+// ---- AI metadata overlay ------------------------------------------------
+
+// Poll the metadata endpoint and repaint the box overlay. The metadata frame
+// carries bbox in ORIGINAL video pixels; we scale by the video element's
+// actual rendered size so the boxes track the displayed stream regardless of
+// layout. Missing frame / 0 detected objects simply clears the canvas.
+const META_INTERVAL_MS = 200
+
+async function pollMetadata() {
+  const canvas = canvasEl.value
+  const video = videoEl.value
+  if (!canvas || !video) return
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+
+  let snap: MetadataSnapshot | undefined
+  try {
+    snap = await api.cameraMetadata(props.cameraId)
+  } catch {
+    // Metadata disabled / not ready yet - keep the overlay empty.
+    clearOverlay(canvas, ctx)
+    aiOn.value = false
+    objectCount.value = 0
+    return
+  }
+
+  const vw = video.videoWidth
+  const vh = video.videoHeight
+  if (!snap.frame || vw === 0 || vh === 0 || snap.frame.objects.length === 0) {
+    clearOverlay(canvas, ctx)
+    aiOn.value = !!snap.status?.running
+    objectCount.value = snap.frame?.object_count ?? 0
+    return
+  }
+
+  const cw = video.clientWidth
+  const ch = video.clientHeight
+  const dpr = window.devicePixelRatio || 1
+  const bw = Math.max(1, Math.round(cw * dpr))
+  const bh = Math.max(1, Math.round(ch * dpr))
+  if (canvas.width !== bw || canvas.height !== bh) {
+    canvas.width = bw
+    canvas.height = bh
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  ctx.clearRect(0, 0, cw, ch)
+
+  const sx = cw / vw
+  const sy = ch / vh
+  ctx.lineWidth = 2
+  ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
+  ctx.textBaseline = 'alphabetic'
+
+  for (const o of snap.frame.objects) {
+    const [x1, y1, x2, y2] = o.bbox
+    const rx = x1 * sx
+    const ry = y1 * sy
+    const rw = (x2 - x1) * sx
+    const rh = (y2 - y1) * sy
+
+    ctx.strokeStyle = 'rgba(0, 220, 200, 0.95)'
+    ctx.lineWidth = 2
+    ctx.strokeRect(rx, ry, rw, rh)
+
+    const label = `${o.class} ${(o.confidence * 100).toFixed(0)}%`
+    const padX = 4
+    const lh = 16
+    const tw = ctx.measureText(label).width
+    const ly = ry - lh
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)'
+    ctx.fillRect(rx, ly, tw + padX * 2, lh)
+    ctx.fillStyle = '#e6f7f4'
+    ctx.fillText(label, rx + padX, ly + lh - 4)
+
+    if (o.track_id > 0) {
+      const tid = '#' + o.track_id
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.45)'
+      ctx.fillText(tid, rx + rw - ctx.measureText(tid).width - padX, ry + lh - 4)
+    }
+  }
+
+  aiOn.value = !!snap.status?.running
+  objectCount.value = snap.frame.objects.length
+}
+
+function clearOverlay(canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D) {
+  if (canvas.width === 0 || canvas.height === 0) return
+  ctx.clearRect(0, 0, canvas.width, canvas.height)
+}
+
 onMounted(() => {
   if (!videoEl.value) return
   player = new StreamPlayer(videoEl.value, props.cameraId)
@@ -81,11 +184,16 @@ onMounted(() => {
     Object.assign(status, s)
   }
   player.start()
+  metaTimer = window.setInterval(pollMetadata, META_INTERVAL_MS)
 })
 
 onUnmounted(() => {
   player?.stop()
   player = null
+  if (metaTimer !== null) {
+    window.clearInterval(metaTimer)
+    metaTimer = null
+  }
 })
 </script>
 
@@ -102,6 +210,14 @@ video {
   width: 100%;
   display: block;
   background: #000;
+}
+
+.box-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
 }
 
 .player-status {
@@ -124,6 +240,11 @@ video {
 
 .state {
   opacity: 0.95;
+}
+
+.ai-badge {
+  opacity: 0.95;
+  color: #00dcc8;
 }
 
 .player-tools {
