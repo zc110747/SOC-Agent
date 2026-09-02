@@ -11,13 +11,40 @@
 # Usage: .\scripts\e2e-test.ps1
 
 param(
-    [int]    $Width  = 240,
-    [int]    $Height = 240,
-    [int]    $Fps    = 8,
-    [string] $Stream = 'camera01'
+    # By default the camera runs at its own native format (--auto). Hardcoded
+    # 240x240@8 came from one specific UVC device and breaks caps negotiation
+    # on every other one. Pass -ForceCaps to pin a format on purpose.
+    [switch] $ForceCaps,
+    [int]    $Width   = 1280,
+    [int]    $Height  = 720,
+    [int]    $Fps     = 30,
+    [string] $Stream  = 'camera01'
 )
 
 $ErrorActionPreference = 'Continue'
+
+# Workaround: this host session can inject case-duplicate PATH variants
+# (Path / PATH / path). PowerShell 5.1's Start-Process builds the child env
+# block with a case-insensitive dictionary and throws "duplicate key" when it
+# meets them. Merge every case-variant of PATH into one canonical 'Path' key
+# before launching anything. This is a no-op in a clean terminal.
+$pathVariants = @([System.Environment]::GetEnvironmentVariables().Keys) |
+    Where-Object { ([string]$_).ToLowerInvariant() -eq 'path' }
+if ($pathVariants.Count -gt 1) {
+    $merged = @()
+    foreach ($v in $pathVariants) {
+        foreach ($p in ([string][System.Environment]::GetEnvironmentVariable($v) -split ';')) {
+            if ($p -ne '') { $merged += $p }
+        }
+    }
+    $merged = $merged | Select-Object -Unique
+    # SetEnvironmentVariable key lookups are case-insensitive, so clearing any
+    # one variant clears all of them; set the canonical key afterwards.
+    foreach ($v in $pathVariants) {
+        [System.Environment]::SetEnvironmentVariable([string]$v, $null, 'Process')
+    }
+    [System.Environment]::SetEnvironmentVariable('Path', ($merged -join ';'), 'Process')
+}
 
 # Project root = parent of the directory holding this script (scripts/).
 $scriptDir = $PSScriptRoot
@@ -54,9 +81,17 @@ $mtx = Start-MediaMtx
 Start-Sleep -Seconds 2
 $R += "[phase1] mediamtx pid=$($mtx.Id)"
 
-$agent = Start-Process -FilePath $exe -ArgumentList `
-    '--camera','0','--width',$Width,'--height',$Height,'--fps',$Fps,
-    '--stream',$Stream,'--log-level','debug','--duration','300' `
+if ($ForceCaps) {
+    $agentArgs = @('--camera','0','--width',$Width,'--height',$Height,'--fps',$Fps)
+} else {
+    # --auto lets the camera pick its native format: one flag that works on
+    # every device instead of a resolution that only fits one.
+    $agentArgs = @('--camera','0','--auto')
+}
+$R += "[phase1] capture mode: $(if ($ForceCaps) { "$($Width)x$($Height)@$($Fps) (forced)" } else { 'auto (native)' })"
+
+$agent = Start-Process -FilePath $exe -ArgumentList ($agentArgs + @(
+    '--stream',$Stream,'--log-level','debug','--duration','300')) `
     -RedirectStandardOutput $agentLog -RedirectStandardError "$agentLog.err" `
     -NoNewWindow -PassThru
 Start-Sleep -Seconds 12

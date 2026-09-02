@@ -58,11 +58,29 @@ mediamtx:
   # all, which looks like "the page loads but the video never starts".
   ice_udp_port: 8189
   ice_tcp_port: 8189
+  # RTP/RTCP UDP receive ports. Exposed here because the defaults (8000/8001)
+  # are shared by every MediaMTX on the box: if a leftover instance still holds
+  # them, the child exits at once with
+  #   "listen udp :8000: bind: Only one usage of each socket address"
+  # and the monitor then reports no cameras at all.
+  rtp_port: 8000
+  rtcp_port: 8001
   # MediaMTX control API port - the server's monitor polls this to discover
   # cameras. This is the reason the joint run must NOT start a second
   # MediaMTX: only this instance exposes the API.
   api_port: 9997
   hls_port: 8888
+
+# AI metadata ingest for the joint run. camera-agent is started with
+# --metadata-url http://127.0.0.1:8081/api/metadata by start-joint.bat.
+metadata:
+  enabled: true
+  retention_rows: 2000
+  max_body_bytes: 1048576
+  # Must stay false here: the agent starts pushing metadata as soon as the
+  # stream is up, which is usually BEFORE the monitor's next 3s poll has
+  # registered the camera row.
+  require_known_camera: false
 
 log:
   level: info

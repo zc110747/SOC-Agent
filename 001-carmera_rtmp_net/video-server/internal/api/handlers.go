@@ -13,7 +13,9 @@ import (
 
 	"video-server/internal/camera"
 	"video-server/internal/config"
+	"video-server/internal/logger"
 	"video-server/internal/mediamtx"
+	"video-server/internal/metadata"
 	"video-server/internal/netiface"
 )
 
@@ -23,10 +25,15 @@ type Handler struct {
 	repo *camera.Repository
 	mtx  *mediamtx.Manager
 	db   *sql.DB
+	// meta stores the AI metadata pushed by camera-agents. It is nil when the
+	// feature is disabled; the ingest handler answers 503 in that case.
+	meta *metadata.Repository
+	// ai deduplicates AI liveness log lines (see aiTracker).
+	ai *aiTracker
 }
 
-func New(cfg *config.Config, repo *camera.Repository, mtx *mediamtx.Manager, db *sql.DB) *Handler {
-	return &Handler{cfg: cfg, repo: repo, mtx: mtx, db: db}
+func New(cfg *config.Config, repo *camera.Repository, mtx *mediamtx.Manager, db *sql.DB, meta *metadata.Repository) *Handler {
+	return &Handler{cfg: cfg, repo: repo, mtx: mtx, db: db, meta: meta, ai: newAITracker()}
 }
 
 // decorate fills computed/transport fields (e.g. rtsp_url) on a camera.
@@ -63,8 +70,8 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 		status = "error"
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
-		"status":      status,
-		"database":    boolStr(dbOK),
+		"status":       status,
+		"database":     boolStr(dbOK),
 		"media_server": boolStr(mediaOK),
 	})
 }
@@ -149,6 +156,13 @@ func (h *Handler) deleteCamera(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	// Best effort: a camera row removed while its AI rows linger would leave
+	// orphaned metadata that /api/metadata keeps reporting forever.
+	if h.meta != nil {
+		if err := h.meta.DeleteCamera(id); err != nil {
+			logger.Warn("cleanup metadata for camera %s failed: %v", id, err)
+		}
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -214,17 +228,17 @@ func (h *Handler) networkAddresses(w http.ResponseWriter, r *http.Request) {
 		urls = append(urls, fmt.Sprintf("http://%s/", net.JoinHostPort(a.IP, strconv.Itoa(h.cfg.Server.HTTPPort))))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"bind":         h.cfg.Server.Bind,
-		"http_port":    h.cfg.Server.HTTPPort,
-		"public_host":  h.cfg.PublicHost(),
-		"rtsp_url":     h.cfg.RTSPURL("<stream-path>"),
-		"media_bind":   h.cfg.MediaMTX.Bind,
-		"rtsp_port":    h.cfg.RTSP.Port,
-		"webrtc_port":  h.cfg.WebRTC.Port,
-		"hls_port":     h.cfg.MediaMTX.HLSPort,
-		"api_listen":   h.cfg.APIListenAddr(),
-		"addresses":    addrs,
-		"web_ui_urls":  urls,
+		"bind":        h.cfg.Server.Bind,
+		"http_port":   h.cfg.Server.HTTPPort,
+		"public_host": h.cfg.PublicHost(),
+		"rtsp_url":    h.cfg.RTSPURL("<stream-path>"),
+		"media_bind":  h.cfg.MediaMTX.Bind,
+		"rtsp_port":   h.cfg.RTSP.Port,
+		"webrtc_port": h.cfg.WebRTC.Port,
+		"hls_port":    h.cfg.MediaMTX.HLSPort,
+		"api_listen":  h.cfg.APIListenAddr(),
+		"addresses":   addrs,
+		"web_ui_urls": urls,
 	})
 }
 

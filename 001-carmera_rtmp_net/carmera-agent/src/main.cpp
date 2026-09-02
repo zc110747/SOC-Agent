@@ -66,6 +66,7 @@ static void print_help() {
         "  --metadata-heartbeat <sec>\n"
         "                         Status message period, 0 = off (default 10)\n"
         "  --metadata-log-payload Dump full JSON at debug level\n"
+        "  --metadata-insecure    Relax TLS cert check (self-signed dev server ONLY)\n"
         "\n"
         "  --version          Show version\n"
         "  --help             Show this help\n";
@@ -124,7 +125,7 @@ int main(int argc, char** argv) {
         std::string ai_model_v;
         // Metadata overrides
         bool md=false, md_no=false, md_url=false, md_cam=false, md_queue=false;
-        bool md_timeout=false, md_hb=false, md_log_payload=false;
+        bool md_timeout=false, md_hb=false, md_log_payload=false, md_insecure=false;
         int  md_queue_v=0, md_timeout_v=0, md_hb_v=0;
         std::string md_url_v, md_cam_v;
     } cli;
@@ -167,6 +168,7 @@ int main(int argc, char** argv) {
         else if (a == "--metadata")            cli.md = true;
         else if (a == "--no-metadata")         cli.md_no = true;
         else if (a == "--metadata-log-payload") cli.md_log_payload = true;
+        else if (a == "--metadata-insecure")    cli.md_insecure = true;
         else if (a == "--metadata-url") { cli.md_url = true;
                                           cli.md_url_v = get_val(i++, "--metadata-url"); }
         else if (a == "--metadata-camera-id") { cli.md_cam = true;
@@ -226,6 +228,7 @@ int main(int argc, char** argv) {
     if (cli.md_timeout)      cfg.metadata.timeout_ms   = cli.md_timeout_v;
     if (cli.md_hb)           cfg.metadata.heartbeat_interval_sec = cli.md_hb_v;
     if (cli.md_log_payload)  cfg.metadata.log_payload  = true;
+    if (cli.md_insecure)     cfg.metadata.skip_tls_verify = true;
     const double duration = cli.dur ? cli.duration_v : 0.0;
 
     ca::log::set_level(cfg.log_level);

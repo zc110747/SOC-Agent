@@ -83,6 +83,10 @@ std::string encode_frame_metadata(const AIFrameResult& r, const MetadataConfig& 
     std::string s;
     s.reserve(256 + r.objects.size() * 96);
     s += "{\"version\":" + std::to_string(cfg.version);
+    // spec 14: every message carries a discriminator. It MUST be emitted here -
+    // without it a receiver can only guess from the payload shape, and a frame
+    // with zero objects is indistinguishable from a malformed heartbeat.
+    s += ",\"type\":\"frame\"";
     s += ",\"camera_id\":" + jstr(cfg.camera_id);
     // spec 15: copied verbatim, never regenerated.
     s += ",\"frame_id\":" + std::to_string(r.frame_id);

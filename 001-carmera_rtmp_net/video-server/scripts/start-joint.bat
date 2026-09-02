@@ -25,11 +25,21 @@ REM    CAMERA_ID       camera index, see: camera-agent --list   (default: auto)
 REM    STREAM_ID       RTSP path name                           (default camera01)
 REM    CAMERA_SOURCE   force a GStreamer source element         (default: auto)
 REM    NO_BROWSER      1 = do not open the browser              (default 0)
+REM    ENABLE_AI       1 = run person detection in the agent    (default 0)
+REM    ENABLE_METADATA 1 = push AI results to the server        (default 0)
+REM    METADATA_URL    full ingest URL                          (default below)
 REM
 REM  Examples:
 REM    scripts\start-joint.bat
 REM    scripts\start-joint.bat --camera 0 --stream cam01
 REM    scripts\start-joint.bat --no-browser
+REM    scripts\start-joint.bat --ai --metadata
+REM
+REM  AI / metadata are OFF by default: detection needs an ONNX model and costs
+REM  CPU. With --metadata the agent POSTs its results to the server, which
+REM  stores them and serves them back at GET /api/cameras/id/metadata.
+REM  Neither can break the video path - the agent keeps streaming even if the
+REM  server rejects, or never receives, a single message.
 REM
 REM  NOTE: --auto is always passed to the agent. The UVC camera here only does
 REM        240x240@8fps natively, so forcing the 1280x720 from camera-agent.yaml
@@ -66,10 +76,13 @@ echo  agent  root: %AGENT_DIR%
 echo ============================================================
 
 REM ---- defaults ----
-if not defined STREAM_ID   set STREAM_ID=camera01
-if not defined NO_BROWSER  set NO_BROWSER=0
+if not defined STREAM_ID      set STREAM_ID=camera01
+if not defined NO_BROWSER     set NO_BROWSER=0
+if not defined ENABLE_AI      set ENABLE_AI=0
+if not defined ENABLE_METADATA set ENABLE_METADATA=0
 set "CAMERA_ARG="
 set "SOURCE_ARG="
+set "AI_ARG="
 
 REM ---- parse args ----
 set "_ctx="
@@ -80,10 +93,14 @@ for %%a in (%*) do (
     if "!_ctx!"=="source" set "CAMERA_SOURCE=%%~a"
     set "_ctx="
   ) else (
-    if /i "%%a"=="--no-browser" set NO_BROWSER=1
-    if /i "%%a"=="--camera"     set "_ctx=camera"
-    if /i "%%a"=="--stream"     set "_ctx=stream"
-    if /i "%%a"=="--source"     set "_ctx=source"
+    if /i "%%a"=="--no-browser"   set NO_BROWSER=1
+    if /i "%%a"=="--camera"       set "_ctx=camera"
+    if /i "%%a"=="--stream"       set "_ctx=stream"
+    if /i "%%a"=="--source"       set "_ctx=source"
+    if /i "%%a"=="--ai"           set ENABLE_AI=1
+    if /i "%%a"=="--no-ai"        set ENABLE_AI=0
+    if /i "%%a"=="--metadata"     set ENABLE_METADATA=1
+    if /i "%%a"=="--no-metadata"  set ENABLE_METADATA=0
   )
 )
 if defined CAMERA_ID   set "CAMERA_ARG=--camera %CAMERA_ID%"
@@ -214,8 +231,17 @@ if not defined CAMERA_ID (
 )
 
 REM ---- (7) start camera-agent, pushing at the SAME MediaMTX ------------
+REM AI / metadata flags are appended only when enabled, so the default run
+REM passes byte-identical arguments to what worked before they existed.
+if "%ENABLE_AI%"=="1" set "AI_ARG=--ai"
+if "%ENABLE_METADATA%"=="1" (
+  if not defined METADATA_URL set "METADATA_URL=http://127.0.0.1:%HTTP_PORT%/api/metadata"
+  REM Delayed expansion on purpose: %AI_ARG% inside a parenthesised block
+  REM would be frozen at parse time, before the --ai line above ran.
+  set "AI_ARG=!AI_ARG! --metadata --metadata-url !METADATA_URL! --metadata-camera-id %STREAM_ID%"
+)
 echo [2/3] Starting camera-agent --auto --stream %STREAM_ID% ...
-set "AGENT_ARGS=%CAMERA_ARG% --stream %STREAM_ID% --server 127.0.0.1 --port %RTSP_PORT% --auto %SOURCE_ARG%"
+set "AGENT_ARGS=%CAMERA_ARG% --stream %STREAM_ID% --server 127.0.0.1 --port %RTSP_PORT% --auto %SOURCE_ARG% %AI_ARG%"
 echo        args: %AGENT_ARGS%
 start "camera-agent" /D "%AGENT_DIR%" cmd /c ""%CA_EXE%" %AGENT_ARGS% --log-level info > "%LOGS%\agent.log" 2>&1"
 
@@ -271,8 +297,12 @@ if "%SHOW_LAN%"=="1" (
   echo     scripts\firewall-add.bat %HTTP_PORT% %RTSP_PORT%
 )
 echo  Camera      : index %CAMERA_ID%  - negotiated natively via --auto
+if "%ENABLE_AI%"=="1" echo  AI          : person detection on - results stay inside the agent
+if "%ENABLE_METADATA%"=="1" echo  Metadata    : !METADATA_URL!
+if "%ENABLE_METADATA%"=="1" echo                read back: GET http://localhost:%HTTP_PORT%/api/cameras/%STREAM_ID%/metadata
 echo  Logs        : %LOGS%\  (video-server.log / agent.log)
 echo  Verify      : python scripts\verify_joint.py
+echo  Verify AI   : python scripts\verify_metadata.py --base-url http://localhost:%HTTP_PORT%
 echo  Stop        : scripts\stop-joint.bat
 echo ============================================================
 echo.

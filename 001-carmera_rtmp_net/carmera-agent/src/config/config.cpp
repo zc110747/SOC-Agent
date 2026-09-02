@@ -177,6 +177,8 @@ bool load_config(Config& cfg, const std::string& path) {
         cfg.metadata.heartbeat_interval_sec =
             as_int(find(*n, "heartbeat_interval_sec"), cfg.metadata.heartbeat_interval_sec);
         cfg.metadata.log_payload = as_bool(find(*n, "log_payload"), cfg.metadata.log_payload);
+        cfg.metadata.skip_tls_verify =
+            as_bool(find(*n, "insecure"), cfg.metadata.skip_tls_verify);
     }
     cfg.device_id = as_str(find(root, "device_id"), cfg.device_id);
     cfg.log_level = as_str(find(root, "log_level"), cfg.log_level);

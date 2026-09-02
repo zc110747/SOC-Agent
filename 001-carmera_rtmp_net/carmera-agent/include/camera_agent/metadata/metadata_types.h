@@ -30,6 +30,12 @@ struct MetadataConfig {
 
     // Full JSON payloads are only dumped at DEBUG level (spec 17).
     bool log_payload = false;
+
+    // TLS server-certificate verification. Secure by default: when the metadata
+    // endpoint uses https, WinHTTP validates the server certificate chain. Set
+    // this to true ONLY for a dev server with a self-signed certificate (ignores
+    // unknown CA / CN / expiry). Never enable in production.
+    bool skip_tls_verify = false;
 };
 
 // Runtime statistics of the metadata sender (spec 18).

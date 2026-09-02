@@ -43,11 +43,34 @@ mediamtx:
   # working when UDP between the phone and this box is blocked.
   ice_udp_port: 8189
   ice_tcp_port: 8189
+  # RTP/RTCP UDP ports MediaMTX receives media on. They are configurable so a
+  # second server can run side by side, and so a box where 8000/8001 are already
+  # taken (another MediaMTX, some other RTP sink) does not make the child die
+  # with "bind: Only one usage of each socket address".
+  rtp_port: 8000
+  rtcp_port: 8001
   # MediaMTX control API port (used for camera auto-discovery).
   api_port: 9997
   # HLS port. The server also proxies it at /hls/<stream>/index.m3u8 so the web
   # UI can fall back to HLS on the same origin (and the same firewall rule).
   hls_port: 8888
+
+# AI metadata ingest: camera-agent pushes detection results and AI heartbeats
+# to POST /api/metadata. Nothing here touches the media path - if the agent
+# stops sending, or sends garbage, RTSP/WebRTC/HLS keep running untouched.
+metadata:
+  enabled: true
+  # Detected-object rows kept PER CAMERA. At ~5 frames/s that is a few minutes
+  # of history. The latest frame and the latest heartbeat are always kept,
+  # regardless of this value.
+  # 0 or negative disables pruning - the table then grows without bound.
+  retention_rows: 2000
+  # Reject oversized payloads before decoding them (bytes).
+  max_body_bytes: 1048576
+  # Reject messages for cameras the monitor has not registered yet.
+  # Keep this false: metadata routinely arrives BEFORE the monitor's next 3s
+  # poll, so requiring a known camera only makes the agent back off for nothing.
+  require_known_camera: false
 
 log:
   level: info   # debug | info | warn | error

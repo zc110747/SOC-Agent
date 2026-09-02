@@ -17,6 +17,7 @@ import (
 	"video-server/internal/database"
 	"video-server/internal/logger"
 	"video-server/internal/mediamtx"
+	"video-server/internal/metadata"
 	"video-server/internal/monitor"
 	"video-server/internal/netiface"
 	"video-server/internal/server"
@@ -80,9 +81,12 @@ func main() {
 		os.Exit(1)
 	}
 	repo := camera.NewRepository(db)
+	// Metadata repo shares the same SQLite handle, so cameras and their AI
+	// results can never drift apart across a backup/restore.
+	meta := metadata.NewRepository(db, cfg.Metadata.RetentionRows, 0)
 	mtx := mediamtx.New(cfg)
 	mon := monitor.New(repo, mtx, cfg)
-	srv := server.New(cfg, db, repo, mtx, mon)
+	srv := server.New(cfg, db, repo, meta, mtx, mon)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

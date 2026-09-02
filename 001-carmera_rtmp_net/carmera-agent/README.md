@@ -313,9 +313,12 @@ ctest --test-dir build --output-on-failure
 ### 2. 端到端验收（`scripts/e2e-test.ps1`，真实 GStreamer 后端）
 
 ```powershell
-.\scripts\e2e-test.ps1                 # 默认 240x240@8fps, stream=camera01
-.\scripts\e2e-test.ps1 -Width 320 -Height 240 -Fps 15
+.\scripts\e2e-test.ps1                 # 默认 --auto（摄像头原生格式）, stream=camera01
+.\scripts\e2e-test.ps1 -ForceCaps -Width 1280 -Height 720 -Fps 30   # 需要时才强制 caps
 ```
+
+> 早期版本默认写死 `240x240@8fps`，那是为某一台 UVC 设备设的，换设备即 caps 协商失败。
+> 现在默认 `--auto`，`-ForceCaps` 才是旧的强制路径。
 
 四阶段自动验证：
 1. 启动 MediaMTX → agent 推流 → 用 `ffmpeg` 拉 3 帧真实画面（验证采集/编码/推流链路通）。
@@ -411,7 +414,9 @@ curl http://127.0.0.1:8000/            # 查看累计条数 / uptime
 
 ### D. 真实设备约束（本机 UVC）
 
-- 唯一摄像头 "UVC Control"，原生 **240×240 @ 8fps**；默认分辨率协商失败。
+- **设备能力随时间变化，不要写死分辨率**：本机先后出现过 "UVC Control"（原生
+  240×240 @ 8fps）和 "Integrated Camera"（到 1280×720 @ 10/30）。强制 caps 会在
+  不匹配的设备上协商失败 → 进重连死循环。**一律用 `--auto`**。
 - 采集源优先 `mfvideosrc`（Media Foundation）；`dshowvideosrc`/`ksvideosrc` 对该设备只出 1 帧。
 - 硬编 `nvh264enc`（NVENC）不支持 I420 → caps 不 pin format，交 `videoconvert` 协商。
 - `rtspclientsink` 自带 RTP payloader，管线里不要串 `rtph264pay`。
@@ -634,6 +639,7 @@ AI 线程                        MetadataManager（独立发送线程）
 | `bbox` 用**原始视频像素** `[x1,y1,x2,y2]`，须满足 `0 <= x1 < x2 <= width` | `bbox_json()` 自写 `clampi()` 裁剪；越界框被夹到画面内；退化框强制 `x2 >= x1+1` |
 | **`frame_id` / `timestamp` 必须来自 `AIFrameResult`，发送方不得重新生成** | 编码器原样拷贝（`frame_id` = 摄像头帧计数，`timestamp` = `GST_BUFFER_PTS/GST_MSECOND`）；代码注释已标注该规范条款 |
 | 协议须带 `version` | 每条消息都带，`MetadataConfig.version` 可配（默认 1） |
+| **每条消息都必须带 `type` 判别字段** | `encode_frame_metadata()` / `encode_status_metadata()` 各自写死 `"type":"frame"` / `"type":"status"`；单测 `metadata_encode_frame`、`metadata_encode_empty_frame` 各有一条断言锁死。2026-09-02 前 `frame` 漏发该字段，零目标帧只带空的 `objects: []`，服务端无法与畸形心跳区分 → 全量 400 |
 | 上报频率 ≈ AI 频率（5/s），**不是 30fps** | 一帧一消息，AI 采样率即上报率 |
 | **空结果也要发**（服务端据此判断 AI 存活） | `objects: []` 照常编码发送 |
 | 服务端地址必须可配，**禁止硬编码** | `metadata.server_url` / `--metadata-url`，无内置兜底地址 |
@@ -702,8 +708,8 @@ std::unique_ptr<IMetadataTransport> create_metadata_transport(const MetadataConf
 
 | 用例 | 断言要点 |
 |------|----------|
-| `metadata_encode_frame` | 字段名/顺序全对；`confidence:0.93`；越界框夹成 `[0,0,1920,1080]` |
-| `metadata_encode_empty_frame` | 空结果仍产出 `"objects":[]` 且 `frame_id` 正确 |
+| `metadata_encode_frame` | 字段名/顺序全对；`confidence:0.93`；越界框夹成 `[0,0,1920,1080]`；**含 `"type":"frame"`** |
+| `metadata_encode_empty_frame` | 空结果仍产出 `"objects":[]` 且 `frame_id` 正确；**含 `"type":"frame"`** |
 | `metadata_encode_status` | 心跳含 `enable/running/fps/model/tracker/last_frame_id/processed` |
 | `metadata_queue_bounded_when_server_down` | 死端口下 30 次 push <100ms、`queue_size ≤ 3`、`dropped+failed > 0` |
 | `metadata_not_started_is_noop` | 未 start 时 push 静默忽略，计数全 0 |
@@ -712,17 +718,44 @@ std::unique_ptr<IMetadataTransport> create_metadata_transport(const MetadataConf
 | `metadata_reconnect_counted_on_recovery` | 惰性 Transport（`connect()` 永不失败）下注入 3 次失败，`reconnect==1` 且 `failed==3` |
 | `metadata_heartbeat_delivered` | 不发任何帧时心跳仍能送达，含 `"type":"status"` |
 
-### 服务端对接说明（给后续 Video Server）
+### 服务端对接说明
+
+> **已上线**：同仓 `../video-server` 已实现接收端（`POST /api/metadata`，落 SQLite 三表）。
+> 见 `video-server/README.md` 第 10 节「AI Metadata 接入」。
+
+对接契约（服务端已按此实现，换其他服务端同样适用）：
 
 1. 提供 `POST <server_url>`，`Content-Type: application/json`，返回 **2xx** 即视为成功（非 2xx 会被记为一次失败并触发退避重连）。
 2. 按 `camera_id` 区分设备；`version` 用于协议演进，服务端应容忍未知新增字段。
 3. `type` 字段区分两类消息：`frame`（检测结果）/ `status`（AI 心跳）。心跳中 `ai.running=false` 或长时间无 `frame` 消息 = AI 异常。
 4. `frame_id` 是**摄像头帧计数**（可能因采样不连续），`timestamp` 是**采集端 PTS（ms）**，`wall_clock` 是**发送端墙钟**——服务端做时序判断请用前两者，判断新鲜度用后者。
 5. 上报速率约 5 msg/s/摄像头，服务端按此估算容量；断连期间消息会**主动丢弃**而非补发，服务端不应假设帧序号连续。
+6. 服务端可以再夹紧一次 `bbox`/`confidence`，**但不得改写 `frame_id`/`timestamp`**。
+
+### 真机联合验证记录（2026-09-02，video-server 8081）
+
+```
+camera-agent --camera 0 --auto --source mfvideosrc --stream camtest \
+  --server 127.0.0.1 --port 8554 --ai --metadata \
+  --metadata-url http://127.0.0.1:8081/api/metadata \
+  --metadata-camera-id camtest --duration 25
+```
+
+| 项 | 结果 |
+|----|------|
+| 视频 | `frames=693 dropped=0 bitrate≈3900kbps status=STREAMING` |
+| AI | `fps=5.0 infer≈44ms processed=118`（`objects=0`：画面内无人） |
+| Metadata | **`sent=120 failed=0 dropped=0 latency≈8ms reconnect=0`** |
+| 服务端落库 | `GET /api/cameras/camtest/metadata` 同时返回 `frame`（`frame_id=719 timestamp=25269 1280x720 object_count=0`）与 `status`（`model=models/yolov8n.onnx tracker=bytetrack fps=5.01`） |
+| 摄像头注册 | `GET /api/cameras` → `camtest online 1280x720` |
+| 服务端验收 | `python video-server/scripts/verify_metadata.py` → **PASS=35 FAIL=0** |
+
+**修复前**（同一次会话的上一轮）是 `sent=0 failed=5 dropped=90`，全部 frame 被 400 拒收 —— 根因即 `encode_frame_metadata()` 漏发 `type`。抓包手段是 `--metadata-log-payload`。
 
 ### 已知边界 / 后续
 
-- 测试 5（AI 异常）与测试 6（AI 关闭）尚未补齐真机长跑记录，单测层已覆盖等价路径。
-- 当前仅 HTTP 明文；HTTPS 已支持（`WINHTTP_FLAG_SECURE` 按 scheme 自动开），但**未做证书校验配置**，生产接入前需补。
+- 测试 5（AI 异常）与测试 6（AI 关闭）**已补真机脚本化验证**：`video-server/scripts/verify_ai_resilience.py`（真实 camera-agent + 真实 video-server）复跑 **PASS=16 FAIL=0** —— 坏模型下视频仍 `STREAMING`、H264 解码正常、心跳 `ai.enable=true/running=false`、fps=30；`--no-ai` 下视频正常、心跳 `ai.enable=false/running=false`。
+- 上述联合验证中 `objects=0`（画面无人），故**真机侧的 `bbox` 落库路径只由服务端验收脚本覆盖**（合成 6 种夹紧场景），未走真实检测结果。下次需对准一个人再跑一轮。
+- HTTPS 已支持（`WINHTTP_FLAG_SECURE` 按 scheme 自动开，**默认校验服务器证书链**）。对使用自签证书的 dev 服务端，可通过 `metadata.insecure: true`（YAML）或 `--metadata-insecure`（CLI）放宽校验（忽略 unknown CA / CN / 过期）——**仅限开发环境，生产切勿开启**。
 - 无本地落盘/补发：断网期间的检测结果按规范丢弃（过时 metadata 无价值）。若后续需要离线缓存，应加在 Transport 层，不动队列语义。
 - 单条消息未做批量合并；若服务端希望降频，可在 Encoder 层做 N 帧聚合（当前按规范保持一帧一消息）。

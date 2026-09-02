@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 
 	_ "modernc.org/sqlite"
+
+	"video-server/internal/metadata"
 )
 
 // Open opens (creating if needed) the SQLite database at path and runs the
@@ -51,5 +53,11 @@ CREATE TABLE IF NOT EXISTS cameras (
 	last_seen    TEXT
 );
 `)
-	return err
+	if err != nil {
+		return err
+	}
+	// AI metadata tables (camera-agent "Metadata" protocol). Kept in the same
+	// database so a camera and its AI results can never drift apart across
+	// backup/restore, but migrated by the metadata package itself.
+	return metadata.Migrate(db)
 }

@@ -54,7 +54,7 @@ video-server/
 ├── cmd/video-server/main.go     # 入口
 ├── internal/                    # Go 后端
 │   ├── api/  config/  camera/  database/  logger/
-│   ├── mediamtx/  monitor/  server/  stream/
+│   ├── mediamtx/  metadata/  monitor/  server/  stream/
 ├── web/                         # Vue3 前端（需 npm build 产出 dist/）
 │   └── dist/                    # 构建产物（被 Go embed）
 ├── config/config.yaml          # 主配置（端口单一来源）
@@ -65,7 +65,8 @@ video-server/
 │   ├── verify_e2e.py           # 端到端验收（ffmpeg 合成流，PASS/FAIL 计数）
 │   ├── start-joint.bat         # 联合运行：一键拉起 server + camera-agent
 │   ├── stop-joint.bat          # 联合运行：停掉全部进程
-│   └── verify_joint.py         # 联合运行验收（真实推流端，PASS/FAIL 计数）
+│   ├── verify_joint.py         # 联合运行验收（真实推流端，PASS/FAIL 计数）
+│   └── verify_metadata.py      # AI metadata 接收验收（含旧版无 type 兼容，PASS/FAIL 计数）
 ├── data/                       # 运行时态（DB / 临时 MediaMTX 配置 / 日志）—— 不提交
 ├── go.mod / go.sum
 └── README.md
@@ -179,6 +180,10 @@ start_oneclick.bat --no-pause      # 无人值守
 | `mediamtx.rtcp_port` | `8001` | RTCP UDP 端口 |
 | `log.level` | `info` | `debug/info/warn/error` |
 | `log.file` | 空 | 留空则日志打到 stdout |
+| `metadata.enabled` | `true` | AI 结果接收开关；`false` → `POST /api/metadata` 返回 503 |
+| `metadata.retention_rows` | `2000` | 每路保留的检测明细条数，`0` = 不裁剪 |
+| `metadata.max_body_bytes` | `1048576` | 单包上限（字节），超出 → 413 |
+| `metadata.require_known_camera` | `false` | `true` = 只接受已登记摄像头；联合运行须为 `false` |
 
 生成给 MediaMTX 的实际配置要点：
 ```yaml
@@ -366,6 +371,7 @@ MediaMTX 上。
 scripts\start-joint.bat                  :: 起服务 + 起推流 + 自动开浏览器
 scripts\start-joint.bat --no-browser     :: 不开浏览器
 scripts\start-joint.bat --camera 0 --stream cam01
+scripts\start-joint.bat --ai --metadata   :: 同时开 AI 检测与结果上报
 scripts\stop-joint.bat                   :: 停掉全部（含 MediaMTX 子进程）
 ```
 
@@ -375,11 +381,18 @@ scripts\stop-joint.bat                   :: 停掉全部（含 MediaMTX 子进�
 | `CAMERA_ID` | 自动（`--list` 枚举后取第一个可用） | 摄像头索引 |
 | `STREAM_ID` | `camera01` | RTSP 路径名 |
 | `CAMERA_SOURCE` | 自动 | 强制 GStreamer 源（mfvideosrc / dshowvideosrc …） |
+| `ENABLE_AI` | `0` | `1` = 给 agent 加 `--ai`（人检测，默认 5 fps） |
+| `ENABLE_METADATA` | `0` | `1` = 加 `--metadata`，把 AI 结果 POST 回服务端 |
+| `METADATA_URL` | `http://127.0.0.1:<HTTP_PORT>/api/metadata` | 上报端点（仅 `ENABLE_METADATA=1` 时生效） |
 | `NO_BROWSER` | `0` | `1` = 不开浏览器 |
 
-> **必须带 `--auto`**：本机 UVC 摄像头原生只支持 **240×240@8fps**，若强制
-> 1280×720@30 会导致 caps 协商失败、流水线进不了 PLAYING、Agent 陷入重连死循环。
-> 两个启动脚本均已默认加上。
+AI 与 Metadata 默认关闭：不是每台机器都有 `models/yolov8n.onnx`，默认开着会让
+联合启动在缺模型时直接失败。开了之后结果落在服务端 SQLite，用
+`curl http://127.0.0.1:8081/api/cameras/<STREAM_ID>/metadata` 查看（详见第 10 节）。
+
+> **必须带 `--auto`**：UVC 摄像头的原生分辨率/帧率各不相同（本机上过 240×240@8fps，
+> 也上过 1280×720@30），写死分辨率会导致 caps 协商失败、流水线进不了 PLAYING、
+> Agent 陷入重连死循环。两个启动脚本均已默认加上。
 
 **脚本自带的三道自检**（无需手动干预）：
 
@@ -534,12 +547,113 @@ scripts\test-stream.bat camera01
 | `GET /api/cameras/{id}/stream` | 播放元数据（rtsp_url、分辨率、fps、bitrate、webrtc.signaling、hls_url） |
 | `POST /api/cameras/{id}/webrtc` | 转发 SDP offer 到 MediaMTX WHEP，返回 answer |
 | `GET /hls/{stream}/index.m3u8` | 同源 HLS 代理（转发到 MediaMTX 的 `hls_port`），手机端兜底播放用 |
+| `POST /api/metadata` | 接收 camera-agent 的 AI 结果（`frame` / `status`），成功一律 `204` |
+| `GET /api/metadata` | 全局概览：`{"enabled","cameras":[{camera_id, frame, status}]}` |
+| `GET /api/cameras/{id}/metadata` | 单路快照：`{"camera_id","frame":{...},"status":{...}}` |
 
 摄像头自动注册由 monitor 驱动：RTSP 推流者连上 MediaMTX 后，`all_others.source: publisher` 会自动创建路径，monitor 检测到 `HasSource` 即按 `stream_path` upsert 为摄像头（`online`/`offline` 由 `Ready` 决定；10s 无数据置 `offline`）。
 
 ---
 
-## 10. 调试与排错
+## 10. AI Metadata 接入（camera-agent → video-server）
+
+camera-agent 的 AI 分支把检测结果异步 POST 到服务端，与视频流经不同通道、互不阻塞。本节描述服务端这一侧的落库行为与可调项。
+
+### 10.1 两类消息
+
+一个端点 `POST /api/metadata`，由 `type` 字段区分：
+
+| `type` | 含义 | 频率 | 落表 |
+|---|---|---|---|
+| `frame` | 一次推理结果：帧号 + 检测框 | 默认 5/s | `ai_frame` + `ai_object` |
+| `status` | AI 存活心跳 + 模型身份 | 默认 10s | `ai_status` |
+
+```jsonc
+// frame
+{"version":1,"type":"frame","camera_id":"camera01","frame_id":719,"timestamp":25269,
+ "video_width":1280,"video_height":720,
+ "objects":[{"class":"person","confidence":0.87,"track_id":7,"bbox":[10,20,100,200]}]}
+
+// status
+{"version":1,"type":"status","camera_id":"camera01","wall_clock":1788356203728,
+ "ai":{"enable":true,"running":true,"fps":5.01,"model":"models/yolov8n.onnx",
+       "tracker":"bytetrack","last_frame_id":571,"last_timestamp":20265,"processed":99}}
+```
+
+**铁律（与 agent 侧一致）**：`frame_id`（摄像头帧计数）与 `timestamp`（采集端 PTS，ms）由**采集侧**产生，服务端**原样存储**，绝不重编号或"修正"。`bbox` 是原始像素 `[x1,y1,x2,y2]`。
+
+### 10.2 三张表
+
+| 表 | 粒度 | 说明 |
+|---|---|---|
+| `ai_status` | 每路一行 | 最新心跳（`ai_enable`/`ai_running`/`ai_fps`/`model`/`tracker`/`processed`） |
+| `ai_frame` | 每路一行 | **最新一帧**的帧号、时间戳、分辨率、目标数 |
+| `ai_object` | 每条目标一行 | 检测明细（`class`/`confidence`/`track_id`/`bbox`），带滚动裁剪 |
+
+`ai_frame` 只留最新帧：监控场景关心"现在画面里有什么"，历史帧由上层日志负责。`ai_object` 按 `retention_rows` 滚动裁剪（默认每路 2000 条），不是每写一次就 DELETE —— 而是每 64 次保存触发一次批量裁剪，避免高频写入被 DELETE 拖慢。
+
+### 10.3 配置
+
+```yaml
+metadata:
+  enabled: true              # false → 端点返回 503 + Retry-After: 30，agent 进入退避
+  retention_rows: 2000       # 每路保留的检测明细条数，0 = 不裁剪
+  max_body_bytes: 1048576    # 单包上限，超出 → 413（decode 之前就拒，不缓冲）
+  require_known_camera: false # true = 只接受已在 cameras 表登记的路
+```
+
+`require_known_camera` 联合运行时**必须为 `false`**：agent 一流起来就开始推 metadata，通常早于 monitor 下一次 3s 轮询把摄像头登记进 `cameras` 表。置 `true` 会让 agent 白退避一轮。
+
+### 10.4 服务端硬化（不信任上游）
+
+agent 已经 clamped，服务端仍然再夹一次：
+
+- `bbox` 先修正 `lo > hi`（反向框），再夹进 `[0, width] × [0, height]`，并保证 `x2 >= x1+1`（退化框会被撑开成 1×1，而不是丢弃）
+- `confidence` 夹到 `[0,1]`
+- `frame` 缺 `camera_id` 或宽高非正 → `400`
+- 坏消息**绝不覆盖好数据**（验收脚本用 `frame_id` 前后比对锁定）
+- 视频流路径完全不受影响：metadata 写失败不会反映到 `/api/health`
+
+### 10.5 旧版 agent 兼容（无 `type` 字段）
+
+2026-09-02 联合验证时发现：agent 的 `encode_frame_metadata()` 漏发 `type`，零目标的帧只带空的 `objects: []`，服务端无法与畸形心跳区分，全部被 400 拒收（现场症状 `sent=0 failed=5 dropped=90`）。
+
+双向修复：
+
+1. **agent 侧**：`metadata_encoder.cpp` 补上 `"type":"frame"`（单测 `metadata_encode_frame` / `metadata_encode_empty_frame` 各加一条断言锁死）
+2. **服务端**：`metadata.InferType()` 按载荷形状兜底 —— 有 `ai` 对象 → `status`；有 `objects` 或 `frame_id` → `frame`；都不匹配 → `400`（不再往下猜）。**显式 `type` 永远优先于推断**
+
+这样已部署的旧 agent 无需升级即可继续上报。
+
+### 10.6 验收
+
+```bash
+# 独立模式：自建服务、自开端口、8s 压测
+python scripts/verify_metadata.py
+
+# 指向已在跑的服务
+python scripts/verify_metadata.py --base-url http://127.0.0.1:8081
+```
+
+覆盖 11 组共 35 项：ingest 基础 / 往返保真 / 心跳 / bbox 硬化（越界、退化、反向）/ 空结果 / 畸形输入（400、413、不覆盖好数据）/ **旧版无 `type` 兼容** / camera_id↔stream_path 双向解析 / 全局概览 / 5 msg/s 持续压测 / 媒体路径不受影响。
+
+当前结果：**PASS=35 FAIL=0**。
+
+### 10.7 查询示例
+
+```bash
+# 单路快照
+curl -s http://127.0.0.1:8081/api/cameras/camera01/metadata | python -m json.tool
+
+# 全局概览
+curl -s http://127.0.0.1:8081/api/metadata | python -m json.tool
+```
+
+未知摄像头返回**空快照**而非 404（`frame`/`status` 为 `null`），这样前端轮询不必区分"没数据"和"没这路"。
+
+---
+
+## 11. 调试与排错
 
 | 现象 | 原因 / 修复 |
 |---|---|
@@ -557,10 +671,15 @@ scripts\test-stream.bat camera01
 | **联合运行**：`.bat` 起的进程随终端一起退出 | 脚本用 `start` 开独立窗口；在某些非交互 shell（如被回收的自动化会话）里子窗口会被连带清理。双击运行或在普通终端里执行 |
 | 首次构建极慢 | `modernc.org/sqlite` 转译库首次编译约 8 分钟，属正常，缓存命中后约 1 分钟 |
 | 构建/拉取模块失败（代理/网络） | 设 `GOPROXY=https://goproxy.cn,direct`；CI 可用 `go build -mod=readonly` 防止改写 `go.mod/go.sum` |
+| **Metadata**：`POST /api/metadata` 返回 503 | `metadata.enabled: false`，或服务端未初始化 repository。检查配置段是否存在；agent 侧会按 `Retry-After: 30` 退避 |
+| **Metadata**：agent 报 `server replied HTTP 400` | 消息缺 `type` 且形状不可识别，或 `frame` 缺 `camera_id`/宽高。用 `--metadata-log-payload` 抓实际载荷比对；旧版无 `type` 的帧服务端已能兜底（见 10.5） |
+| **Metadata**：`GET /api/cameras/{id}/metadata` 返回空 | 落库用的 camera_id 与查询用的不一致。`resolveCamera` 会先把 id 规范化（`Get` → `GetByStreamPath`）再回写，但未知 id 在 permissive 模式下原样存储。查 `GET /api/metadata` 看实际存的 `camera_id` |
+| **Metadata**：单包返回 413 | 超出 `metadata.max_body_bytes`（默认 1 MiB）。调大该值，或让 agent 降低单帧目标数 |
+| **Metadata**：`media_server: error` 且没有任何摄像头 | MediaMTX 子进程因 UDP 端口冲突退出（默认 RTP/RTCP 8000/8001 是全局共享的）。给 `mediamtx.rtp_port` / `rtcp_port` 显式配值，并 `taskkill` 残留 mediamtx |
 
 ---
 
-## 11. 典型工作流（开发 → 验收）
+## 12. 典型工作流（开发 → 验收）
 
 ```bash
 # 1) 改代码后重新构建
@@ -578,12 +697,16 @@ scripts\test-stream.bat camera02
 
 # 5) 无人值守端到端验收
 python3 scripts/verify_e2e.py --binary video-server.exe
+python3 scripts/verify_metadata.py
 #    观察结尾  == RESULT: PASS=N FAIL=0 ==
+
+# 6) 单元测试
+go test ./...
 ```
 
 ---
 
-## 12. 提交注意（`.gitignore` 建议）
+## 13. 提交注意（`.gitignore` 建议）
 
 `data/` 为运行时态，建议忽略：
 ```

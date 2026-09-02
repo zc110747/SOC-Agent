@@ -18,7 +18,31 @@ type Config struct {
 	WebRTC   WebRTCConfig   `yaml:"webrtc"`
 	Database DatabaseConfig `yaml:"database"`
 	MediaMTX MediaMTXConfig `yaml:"mediamtx"`
+	Metadata MetadataConfig `yaml:"metadata"`
 	Log      LogConfig      `yaml:"log"`
+}
+
+// MetadataConfig controls the AI-metadata ingest endpoint (POST /api/metadata)
+// that camera-agents push their detection results and heartbeats to.
+type MetadataConfig struct {
+	// Enabled gates the endpoint. When false the route is registered but
+	// answers 503, which makes the agent back off instead of hammering a
+	// service the operator deliberately turned off.
+	Enabled bool `yaml:"enabled"`
+	// RetentionRows is how many detected-object rows are kept per camera.
+	// The history table grows by one row per object per frame (about 5
+	// frames/s x a handful of objects), so it must be bounded.
+	// <= 0 disables pruning entirely, which WILL grow without bound.
+	RetentionRows int `yaml:"retention_rows"`
+	// MaxBodyBytes rejects oversized payloads before they are decoded, so a
+	// broken or hostile agent cannot exhaust memory with one POST.
+	MaxBodyBytes int64 `yaml:"max_body_bytes"`
+	// RequireKnownCamera makes the endpoint reject messages for a camera that
+	// the monitor has not registered yet. Default false on purpose: the
+	// monitor polls MediaMTX every 3s, so metadata routinely arrives before
+	// the camera row exists, and rejecting it would only make the agent
+	// needlessly back off and drop frames.
+	RequireKnownCamera bool `yaml:"require_known_camera"`
 }
 
 type ServerConfig struct {
@@ -95,7 +119,13 @@ func Default() *Config {
 			Bind: "0.0.0.0", APIBind: "127.0.0.1", APIPort: 9997, HLSPort: 8888,
 			RTPPort: 8000, RTCPPort: 8001, ICEUDPPort: 8189, ICETCPPort: 8189,
 		},
-		Log:      LogConfig{Level: "info"},
+		Metadata: MetadataConfig{
+			Enabled:            true,
+			RetentionRows:      2000,
+			MaxBodyBytes:       1 << 20, // 1 MiB
+			RequireKnownCamera: false,
+		},
+		Log: LogConfig{Level: "info"},
 	}
 }
 

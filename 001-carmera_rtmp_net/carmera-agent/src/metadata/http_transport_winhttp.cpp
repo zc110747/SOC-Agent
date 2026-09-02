@@ -76,6 +76,18 @@ public:
         if (timeout_ms > 0)
             WinHttpSetTimeouts(req, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
 
+        // Dev-only escape hatch: a metadata server fronted by a self-signed
+        // certificate cannot pass WinHTTP's default chain validation. When the
+        // operator explicitly opts in (skip_tls_verify), relax the checks so the
+        // POST can succeed. This is a no-op for plain http and for https with a
+        // valid certificate, so the secure default is never weakened silently.
+        if (secure_ && cfg_.skip_tls_verify) {
+            DWORD sec = SECURITY_FLAG_IGNORE_CERT_CN_INVALID
+                      | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
+                      | SECURITY_FLAG_IGNORE_UNKNOWN_CA;
+            WinHttpSetOption(req, WINHTTP_OPTION_SECURITY_FLAGS, &sec, sizeof(sec));
+        }
+
         const std::wstring hdr = L"Content-Type: application/json";
         bool ok = false;
         if (WinHttpSendRequest(req, hdr.c_str(), static_cast<DWORD>(hdr.size()),

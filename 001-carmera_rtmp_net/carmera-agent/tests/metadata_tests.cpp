@@ -104,6 +104,9 @@ TEST(metadata_encode_frame) {
 
     const std::string s = ca::encode_frame_metadata(r, cfg);
     ASSERT(contains(s, "\"version\":1"));
+    // spec 14: the frame discriminator. It was missing once, which made every
+    // frame message a protocol violation for a spec-following receiver.
+    ASSERT(contains(s, "\"type\":\"frame\""));
     ASSERT(contains(s, "\"camera_id\":\"camera_001\""));
     ASSERT(contains(s, "\"frame_id\":15230"));
     ASSERT(contains(s, "\"timestamp\":1756773210123"));
@@ -121,6 +124,7 @@ TEST(metadata_encode_frame) {
 TEST(metadata_encode_empty_frame) {
     ca::MetadataConfig cfg;
     const std::string s = ca::encode_frame_metadata(make_result(15236, 1756773210323ULL, 1280, 720), cfg);
+    ASSERT(contains(s, "\"type\":\"frame\""));
     ASSERT(contains(s, "\"objects\":[]"));
     ASSERT(contains(s, "\"frame_id\":15236"));
     ASSERT(contains(s, "\"video_width\":1280"));

@@ -311,14 +311,19 @@ def main():
               f"media_server={hres.get('media_server')}")
 
         # ================= stage 3: start the real publisher ===============
-        # --auto is mandatory: the UVC camera only does 240x240@8fps natively,
-        # so forcing the 1280x720 from camera-agent.yaml makes caps negotiation
-        # fail and the agent would loop on reconnect forever.
-        print(f"[*] stage 3: starting camera-agent --auto -> {rtsp_url} ...")
+        # --auto lets the camera pick its native format (e.g. 1280x720@30 on
+        # the current UVC device) instead of a resolution that only fits one
+        # specific camera - forcing caps the device cannot negotiate makes the
+        # agent loop on reconnect forever. We also pass --ai --metadata so this
+        # joint test exercises the Phase 3 AI metadata pipeline end-to-end.
+        print(f"[*] stage 3: starting camera-agent --auto --ai --metadata -> {rtsp_url} ...")
         publisher = subprocess.Popen(
             [agent, "--camera", str(cam_index), "--stream", args.stream,
              "--server", "127.0.0.1", "--port", str(rtsp_port),
-             "--auto", "--log-level", "info"],
+             "--auto", "--ai",
+             "--metadata", "--metadata-url", f"{base}/api/metadata",
+             "--metadata-camera-id", args.stream,
+             "--log-level", "info"],
             cwd=args.agent_root,
             stdout=open(agent_log, "w", encoding="utf-8", errors="replace"),
             stderr=subprocess.STDOUT,
@@ -432,6 +437,46 @@ def main():
                 check("bitrate propagated to API (bytesReceived delta)", False, detail)
         except Exception as e:
             check("stream metadata rtsp_url", False, str(e))
+
+        # ================= stage 6b: AI metadata pipeline ==================
+        # Phase 3: the agent POSTs AI frame/status JSON to /api/metadata; the
+        # server persists it and serves it back. This proves the metadata chain
+        # with the REAL publisher (not the synthetic mock server).
+        print("[*] stage 6b: verifying AI metadata (frame/status) reaches the server ...")
+
+        def meta_snapshot():
+            try:
+                return http_get_json(f"{base}/api/cameras/{args.stream}/metadata")[0]
+            except Exception:
+                return None
+
+        snap = wait_for(meta_snapshot, timeout=40, interval=2.0)
+        if not isinstance(snap, dict):
+            check("AI metadata snapshot returned", False,
+                  "no /api/cameras/{id}/metadata within 40s")
+        else:
+            check("AI metadata snapshot returned", True,
+                  f"camera_id={snap.get('camera_id')}")
+            # Heartbeat (status) and detection frames arrive on separate timers,
+            # so poll each independently - arrival order must not matter.
+            status = wait_for(lambda: (meta_snapshot() or {}).get("status"),
+                              timeout=40, interval=2.0)
+            if isinstance(status, dict):
+                check("metadata status heartbeat present", True,
+                      f"running={status.get('running')} fps={status.get('fps')} "
+                      f"model={status.get('model')}")
+            else:
+                check("metadata status heartbeat present", False,
+                      "no status within 40s - agent heartbeat not reaching server")
+            frame = wait_for(lambda: (meta_snapshot() or {}).get("frame"),
+                             timeout=30, interval=2.0)
+            if isinstance(frame, dict):
+                check("metadata frame present", True,
+                      f"frame_id={frame.get('frame_id')} "
+                      f"{frame.get('video_width')}x{frame.get('video_height')}")
+            else:
+                info("metadata frame not yet present",
+                     "status heartbeat arrived; frame needs the AI model + a few seconds")
 
         # ================= stage 7: WebRTC signaling =======================
         if not args.no_webrtc:

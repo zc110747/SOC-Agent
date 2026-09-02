@@ -16,6 +16,7 @@ import (
 	"video-server/internal/config"
 	"video-server/internal/logger"
 	"video-server/internal/mediamtx"
+	"video-server/internal/metadata"
 	"video-server/internal/monitor"
 	"video-server/internal/netiface"
 	"video-server/web"
@@ -26,13 +27,14 @@ type Server struct {
 	cfg        *config.Config
 	db         *sql.DB
 	repo       *camera.Repository
+	meta       *metadata.Repository
 	mtx        *mediamtx.Manager
 	mon        *monitor.Monitor
 	httpServer *http.Server
 }
 
-func New(cfg *config.Config, db *sql.DB, repo *camera.Repository, mtx *mediamtx.Manager, mon *monitor.Monitor) *Server {
-	return &Server{cfg: cfg, db: db, repo: repo, mtx: mtx, mon: mon}
+func New(cfg *config.Config, db *sql.DB, repo *camera.Repository, meta *metadata.Repository, mtx *mediamtx.Manager, mon *monitor.Monitor) *Server {
+	return &Server{cfg: cfg, db: db, repo: repo, meta: meta, mtx: mtx, mon: mon}
 }
 
 // Start launches MediaMTX, the monitor and the HTTP server. It blocks until the
@@ -43,7 +45,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	go s.mon.Run(ctx)
 
-	h := api.New(s.cfg, s.repo, s.mtx, s.db)
+	h := api.New(s.cfg, s.repo, s.mtx, s.db, s.meta)
 	mux := http.NewServeMux()
 	h.Register(mux)
 
