@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AI resilience acceptance -- Phase 2 spec §22, tests 5 & 6.
+AI resilience acceptance -- Phase 2 spec §22, tests 2/3/4/5/6.
 
-These two cases are the heart of the project's two iron laws:
+These cases exercise every branch of the project's two iron laws:
   1. an AI anomaly MUST NOT break the video stream;
   2. AI disabled MUST NOT break the agent (video + metadata still healthy).
 
@@ -23,6 +23,13 @@ backend) against a REAL video-server, exactly like scripts/verify_joint.py:
       -> assert STREAMING + video decode + a healthy metadata heartbeat with
          ai.enable=false, ai.running=false. Proves the agent is fully usable
          with the AI branch disabled.
+
+  Test 7 (server down / network down / recovery) closes the remaining gap in
+  §22 (tests 2/3/4): launch camera-agent --ai --metadata, let metadata flow,
+  then KILL the video-server (which also takes its MediaMTX child down). Assert
+  the agent process survives the blackout and shows reconnect/backoff handling,
+  then restart the server and assert the metadata heartbeat auto-resumes AND the
+  stored frame_id advances past the pre-outage baseline.
 
 Stdlib only (urllib + subprocess). ffmpeg/ffprobe resolved from PATH.
 One video-server serves both scenarios to keep the run fast and the port block
@@ -250,6 +257,20 @@ def wait_status(base, stream, timeout=30, interval=2.0):
     return wait_for(pred, timeout=timeout, interval=interval)
 
 
+def meta_frame_id(base, stream, timeout=30, interval=2.0):
+    """Latest stored frame_id for a stream, or None if not yet present."""
+    def pred():
+        try:
+            snap, _ = http_get_json(f"{base}/api/cameras/{stream}/metadata")
+        except Exception:
+            return None
+        fr = snap.get("frame")
+        if isinstance(fr, dict) and isinstance(fr.get("frame_id"), int):
+            return fr.get("frame_id")
+        return None
+    return wait_for(pred, timeout=timeout, interval=interval)
+
+
 def main():
     ap = argparse.ArgumentParser()
     here = os.path.dirname(os.path.abspath(__file__))
@@ -306,7 +327,7 @@ def main():
     base = f"http://{args.host}:{http_port}"
     rtsp_url = f"rtsp://127.0.0.1:{rtsp_port}/{args.stream}"
 
-    print("== AI resilience acceptance (spec 22, tests 5 & 6) ==")
+    print("== AI resilience acceptance (spec 22, tests 2/3/4/5/6) ==")
     print(f"   video-server : {args.binary}")
     print(f"   camera-agent : {agent}")
     print(f"   http={http_port} rtsp={rtsp_port}  stream={rtsp_url}")
@@ -497,6 +518,117 @@ def main():
             check("scenario6 live fps > 0 (normal operation)", False, detail)
 
         kill_tree(pub2)
+        agent_proc_holder[0] = None
+
+        # ===================================================================
+        # Scenario 7: server down then back (spec §22 tests 2, 3, 4).
+        # The video-server also hosts MediaMTX, so killing it removes the RTSP
+        # peer too -- the assertion is that the AGENT process survives the
+        # outage and auto-resumes metadata when the server returns, NOT that
+        # playback continues through the blackout. That is exactly what the
+        # iron law requires ("server down -> AI/video keep running, metadata
+        # auto-reconnects").
+        # ===================================================================
+        print()
+        print("[*] scenario 7: server down -> agent survives -> server back (reconnect)")
+        s7 = args.stream + "down"
+        rtsp_url7 = f"rtsp://127.0.0.1:{rtsp_port}/{s7}"
+        agent_log7 = os.path.join(args.project_root, "data", f"ai_res_down_{run_id}.log")
+        pub7 = subprocess.Popen(
+            [agent, "--camera", str(cam_index), "--stream", s7,
+             "--server", "127.0.0.1", "--port", str(rtsp_port),
+             "--auto", "--ai",
+             "--metadata", "--metadata-url", f"{base}/api/metadata",
+             "--metadata-camera-id", s7, "--metadata-heartbeat", "5",
+             "--log-level", "info"],
+            cwd=args.agent_root,
+            stdout=open(agent_log7, "w", encoding="utf-8", errors="replace"),
+            stderr=subprocess.STDOUT,
+        )
+        agent_proc_holder[0] = pub7
+
+        res7 = wait_for(lambda: agent_streaming(pub7, agent_log7),
+                        timeout=45, interval=1.0)
+        if isinstance(res7, Exception) or not res7:
+            print("    agent log tail:"); tail(agent_log7)
+            detail = str(res7) if isinstance(res7, Exception) else "no STREAMING within 45s"
+            check("scenario7 agent reached STREAMING", False, detail)
+            return _finish_with(cleanup)
+        check("scenario7 agent reached STREAMING", True, "(baseline before outage)")
+
+        reg7 = wait_camera_registered(base, s7)
+        check("scenario7 camera auto-registered", bool(reg7), f"stream={s7}")
+
+        snap7 = wait_status(base, s7)
+        if not isinstance(snap7, dict):
+            check("scenario7 metadata heartbeat present (baseline)", False,
+                  "no status heartbeat within 30s")
+        else:
+            check("scenario7 metadata heartbeat present (baseline)", True,
+                  f"enable={snap7.get('enable')} running={snap7.get('running')}")
+
+        # Baseline frame id while the server is still healthy.
+        baseline = meta_frame_id(base, s7)
+        if isinstance(baseline, int):
+            info("scenario7 baseline frame_id", str(baseline))
+        else:
+            info("scenario7 baseline frame_id", "not available (will only assert resume)")
+
+        # ----- simulate server / network down -----
+        print("    [sim] killing video-server (takes MediaMTX + metadata API down)")
+        kill_tree(server)
+        time.sleep(6)  # let the agent notice the lost peer
+        alive = pub7.poll() is None
+        check("scenario7 agent survives server-down (pipeline alive)", alive,
+              "camera-agent process still running after server kill")
+        try:
+            with open(agent_log7, "r", encoding="utf-8", errors="replace") as f:
+                log7 = f.read()
+            reacting = any(k in log7 for k in
+                          ("reconnect", "DISCONNECTED", "send failed", "offline",
+                           "REFUSED", "timed out", "connection lost"))
+            check("scenario7 agent reacts to outage (reconnect/backoff)", reacting,
+                  "log shows disconnect/reconnect handling")
+        except Exception as e:
+            check("scenario7 agent reacts to outage (reconnect/backoff)", False, str(e))
+
+        # ----- bring the server back -----
+        print("    [sim] restarting video-server")
+        server = subprocess.Popen(
+            [args.binary, cfg_path], cwd=args.project_root,
+            stdout=open(server_log, "a", encoding="utf-8", errors="replace"),
+            stderr=subprocess.STDOUT,
+        )
+        hres2 = wait_for(lambda: http_get_json(f"{base}/api/health")[0],
+                         timeout=45, interval=1.0)
+        if isinstance(hres2, Exception) or not isinstance(hres2, dict):
+            check("scenario7 server recovered (/api/health)", False, str(hres2))
+        else:
+            check("scenario7 server recovered (/api/health)", True, json.dumps(hres2))
+
+        stt7 = wait_status(base, s7, timeout=40, interval=2.0)
+        if not isinstance(stt7, dict):
+            check("scenario7 metadata auto-resumed after recovery", False,
+                  "no status heartbeat after server restart")
+        else:
+            check("scenario7 metadata auto-resumed after recovery", True,
+                  f"enable={stt7.get('enable')} running={stt7.get('running')}")
+
+        # frame_id advancing past the pre-outage baseline proves the agent kept
+        # producing frames through the blackout and flushed the latest one once
+        # the link returned (test 4: auto-recovery of sending).
+        recovered = meta_frame_id(base, s7, timeout=30, interval=2.0)
+        if isinstance(recovered, int) and isinstance(baseline, int) and recovered > baseline:
+            check("scenario7 metadata frame_id advanced past outage", True,
+                  f"{baseline} -> {recovered}")
+        elif isinstance(recovered, int) and not isinstance(baseline, int):
+            check("scenario7 metadata frame_id readable after recovery", True,
+                  f"recovered={recovered}")
+        else:
+            detail = f"baseline={baseline} recovered={recovered}"
+            check("scenario7 metadata frame_id advanced past outage", False, detail)
+
+        kill_tree(pub7)
         agent_proc_holder[0] = None
 
     finally:

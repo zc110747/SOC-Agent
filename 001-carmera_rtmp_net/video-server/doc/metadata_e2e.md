@@ -78,7 +78,7 @@ Camera (UVC)
 | 6 | 重连机制 | agent 侧指数退避重连；服务端 `metadata.enabled=false` 时返回 `503 + Retry-After:30`，agent 据此退避。服务端对重连透明，无需状态机 |
 | 7 | 配置参数 | `metadata.enabled` / `retention_rows` / `max_body_bytes` / `require_known_camera`（见 README §10.3）。**无硬编码地址**，全部走 YAML |
 | 8 | 性能测试 | `verify_metadata.py` 第 10 组：5 msg/s 持续 10s，44 条全收，最新帧即末帧 |
-| 9 | 网络异常测试 | `verify_joint.py` stage 6b + 第 11 组：agent 离线/服务端不可达时，视频流与 `/api/health` 不受影响 |
+| 9 | 网络异常测试 | `verify_ai_resilience.py` scenario7：杀掉 video-server（含 MediaMTX）→ agent 进程存活且进入重连/退避 → 重启后 metadata 心跳自动恢复、`frame_id` 越过断点（48→50）；`verify_joint.py` 第 11 组佐证媒体路径不受影响 |
 | 10 | AI 异常测试 | `verify_ai_resilience.py` scenario5（坏模型 → 视频 STREAMING + H264 + 心跳 `enable=true/running=false`）/ scenario6（`--no-ai` → 视频正常 + 心跳 `enable=false/running=false`） |
 | 11 | 视频稳定性测试 | 全部 scenario 中 ffprobe 均解出 `h264 1280x720`、fps=30，证视频流不受 AI/Metadata 影响 |
 | 12 | 后续服务器对接说明 | 见 §4：Web UI / 告警引擎 / 微信 / 邮件通过 `GET /api/cameras/{id}/metadata` 拉取快照，或 `GET /api/metadata` 拉全局概览；视频流走 RTSP/WebRTC/HLS，与 Metadata 通道正交 |
@@ -111,9 +111,9 @@ python scripts/verify_ai_resilience.py  # spec §22 测试5/6（AI 异常 / AI �
 |---|---|---|
 | `verify_metadata.py` | **PASS=35 FAIL=0** | 接入 / 往返保真 / 心跳 / bbox 硬化 / 空结果 / 畸形拒绝 / 旧版兼容 / camera_id 映射 / 概览 / 5msg-s 压测 / 媒体路径不受影响 |
 | `verify_joint.py` | **PASS=17 FAIL=0 INFO=2** | 全栈协商 1280×720@30、RTSP 解码、分辨率/fps/码率回传、frame+status 双落库（WebRTC 502 为预期 INFO） |
-| `verify_ai_resilience.py` | **PASS=16 FAIL=0 INFO=2** | §22 测试5（坏模型→视频 STREAMING+H264+fps=30+心跳 enable=true/running=false）/ 测试6（`--no-ai`→视频正常+心跳 enable=false/running=false） |
+| `verify_ai_resilience.py` | **PASS=24 FAIL=0 INFO=3** | §22 测试5（坏模型→视频 STREAMING+H264+fps=30+心跳 enable=true/running=false）/ 测试6（`--no-ai`→视频正常+心跳 enable=false/running=false）/ 测试7（杀服务→agent 存活+重连→重启后 metadata 自动恢复且 `frame_id` 越断点 48→50） |
 
-**合计 68 PASS / 0 FAIL。** spec §22 六类验收（测试1 全正常 / 2 服务关重连 / 3 网络断不崩 / 4 恢复发送 / 5 AI 异常 / 6 AI 关闭）均真机通过。
+**合计 76 PASS / 0 FAIL。** spec §22 六类验收（测试1 全正常 / 2 服务关重连 / 3 网络断不崩 / 4 恢复发送 / 5 AI 异常 / 6 AI 关闭）全部真机通过。
 
 ---
 
