@@ -11,6 +11,8 @@
 #include "camera_agent/config.h"
 #include "camera_agent/backoff.h"
 #include "camera_agent/video_pipeline.h"
+#include "camera_agent/ai/ai_pipeline.h"
+#include "camera_agent/metadata/metadata_manager.h"
 
 namespace ca {
 
@@ -52,6 +54,24 @@ public:
     // (Test/debug) Force the underlying link to drop, exercising reconnect.
     void simulate_link_lost();
 
+    // ---- AI branch --------------------------------------------------------
+    // Starts the independent AI pipeline after the video pipeline is up and the
+    // capture format is known. Any failure here is logged and swallowed: the
+    // caller keeps a fully functional video stream (spec 3.1 / 19).
+    void start_ai();
+
+    // Access to the AI branch (never null; enable=false -> idle object).
+    AIPipeline&       ai()       { return ai_; }
+    const AIPipeline& ai() const { return ai_; }
+
+    // ---- Metadata branch --------------------------------------------------
+    // Starts the asynchronous metadata sender (Phase 2). Independent of both the
+    // video and the AI branch: failures only produce WARN logs.
+    void start_metadata();
+
+    MetadataManager&       metadata()       { return meta_; }
+    const MetadataManager& metadata() const { return meta_; }
+
 private:
     void on_status(StreamStatus s);
     void reconnect_loop();
@@ -80,6 +100,20 @@ private:
     static constexpr double kStableGraceSec = 3.0;
     std::chrono::steady_clock::time_point last_disconnect_ =
         std::chrono::steady_clock::now();
+
+    // Metadata branch: owns its own thread and bounded queue. Optional like the
+    // AI branch; declared BEFORE ai_ so that it outlives it (the AI thread is
+    // the producer that pushes into it).
+    MetadataManager meta_;
+
+    // AI branch: owns its own thread and bounded queue. It is completely
+    // optional - if it never starts, nothing else changes.
+    AIPipeline ai_;
+
+    // Last AI frame seen - mirrored here so the metadata heartbeat can report
+    // LAST_FRAME_ID / LAST_TIMESTAMP (spec 13) without touching AI internals.
+    std::atomic<uint64_t> last_ai_frame_id_{0};
+    std::atomic<uint64_t> last_ai_ts_{0};
 };
 
 } // namespace ca

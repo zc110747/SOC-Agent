@@ -238,6 +238,62 @@ if(CAMERA_AGENT_BACKEND STREQUAL "gstreamer" OR CAMERA_AGENT_BACKEND STREQUAL "a
   endif()
 endif()
 
+# ---- ONNX Runtime detection (optional; powers the AI branch) ----------------
+# The AI branch is fully optional: when ONNX Runtime is not found the project
+# still builds and runs, the only difference is that the detector cannot load a
+# model (video streaming is unaffected by design - spec 19).
+#
+# Root resolution order (first hit wins):
+#   1. -DONNXRUNTIME_ROOT=<path>   explicit, per machine, never committed
+#   2. $ENV{ONNXRUNTIME_ROOT}      recommended per-machine variable
+#   3. a few generic default prefixes
+# A candidate is accepted only if include/onnxruntime_cxx_api.h really exists,
+# so a wrong path is rejected instead of producing confusing compile errors.
+option(CAMERA_AGENT_ENABLE_AI "Enable the AI branch (person detection + tracking)" ON)
+set(ONNXRUNTIME_ROOT "" CACHE PATH
+    "ONNX Runtime install root (the directory holding include/ and lib/)")
+
+set(HAVE_ORT OFF)
+
+if(CAMERA_AGENT_ENABLE_AI)
+  set(_ort_root "")
+  foreach(_c "${ONNXRUNTIME_ROOT}" "$ENV{ONNXRUNTIME_ROOT}"
+             "D:/Software/onnxruntime" "C:/onnxruntime"
+             "$ENV{ProgramFiles}/onnxruntime" "/usr/local" "/opt/onnxruntime")
+    if(NOT _c STREQUAL "")
+      string(REPLACE "\\" "/" _p "${_c}")
+      string(REGEX REPLACE "/+$" "" _p "${_p}")
+      if(EXISTS "${_p}/include/onnxruntime_cxx_api.h")
+        set(_ort_root "${_p}")
+        break()
+      endif()
+    endif()
+  endforeach()
+
+  if(_ort_root)
+    unset(_ort_lib CACHE)
+    find_library(_ort_lib NAMES onnxruntime
+                 HINTS "${_ort_root}/lib" "${_ort_root}" NO_DEFAULT_PATH)
+    if(NOT _ort_lib)
+      unset(_ort_lib CACHE)
+      find_library(_ort_lib NAMES onnxruntime)
+    endif()
+    if(_ort_lib)
+      set(HAVE_ORT ON)
+      set(ORT_INCLUDE_DIRS "${_ort_root}/include")
+      set(ORT_LIBRARIES "${_ort_lib}")
+      set(ORT_RUNTIME_DIR "${_ort_root}/lib")
+      message(STATUS "ONNX Runtime: ${_ort_root}")
+    else()
+      message(STATUS "ONNX Runtime: headers found at ${_ort_root}, "
+                     "but no import library (AI will not load a model)")
+    endif()
+  else()
+    message(STATUS "ONNX Runtime: <not found> "
+                   "(set -DONNXRUNTIME_ROOT=<path> to enable the AI branch)")
+  endif()
+endif()
+
 # ---- Resolve backend --------------------------------------------------------
 if(CAMERA_AGENT_BACKEND STREQUAL "auto")
   if(HAVE_GSTREAMER)

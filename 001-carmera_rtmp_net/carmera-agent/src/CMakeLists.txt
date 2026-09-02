@@ -2,6 +2,15 @@ set(SOURCES
   main.cpp
   config/config.cpp
   common/stream_controller.cpp
+  # AI branch (backend independent: the detector picks its implementation at
+  # compile time from CAMERA_AGENT_HAVE_ORT).
+  ai/ai_pipeline.cpp
+  ai/byte_tracker.cpp
+  ai/yolo_detector.cpp
+  # Metadata branch (Phase 2): encode -> bounded queue -> async sender thread.
+  metadata/metadata_encoder.cpp
+  metadata/metadata_manager.cpp
+  metadata/http_transport_winhttp.cpp
 )
 
 if(CAMERA_AGENT_BACKEND STREQUAL "gstreamer")
@@ -31,6 +40,34 @@ else()
 endif()
 
 target_link_libraries(camera-agent PRIVATE spdlog::spdlog)
+
+# Metadata transport: WinHTTP is an OS component, so there is nothing to install.
+if(WIN32)
+  target_link_libraries(camera-agent PRIVATE winhttp)
+endif()
+
+if(HAVE_ORT)
+  target_include_directories(camera-agent PRIVATE ${ORT_INCLUDE_DIRS})
+  target_link_libraries(camera-agent PRIVATE ${ORT_LIBRARIES})
+  target_compile_definitions(camera-agent PRIVATE CAMERA_AGENT_HAVE_ORT)
+  # The prebuilt Windows package ships the import library next to the DLLs, so
+  # copy them beside the executable: no machine-specific PATH edit needed.
+  set(_ort_dlls "")
+  foreach(_d onnxruntime.dll onnxruntime_providers_shared.dll)
+    if(EXISTS "${ORT_RUNTIME_DIR}/${_d}")
+      list(APPEND _ort_dlls "${ORT_RUNTIME_DIR}/${_d}")
+    endif()
+  endforeach()
+  if(_ort_dlls)
+    add_custom_command(TARGET camera-agent POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_ort_dlls}
+              $<TARGET_FILE_DIR:camera-agent>
+      COMMENT "Copying ONNX Runtime DLLs next to camera-agent")
+  endif()
+else()
+  message(STATUS "AI branch: compiled WITHOUT a model backend "
+                 "(only the pipeline/tracker are active)")
+endif()
 
 if(CAMERA_AGENT_BACKEND STREQUAL "gstreamer")
   target_include_directories(camera-agent PRIVATE ${GST_INCLUDE_DIRS})

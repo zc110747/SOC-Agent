@@ -106,6 +106,10 @@ std::string as_str(const YNode* n, const std::string& def) {
     if (!n || n->type != YNode::SCALAR) return def;
     return n->scalar;
 }
+float as_float(const YNode* n, float def) {
+    if (!n || n->type != YNode::SCALAR) return def;
+    return static_cast<float>(std::atof(n->scalar.c_str()));
+}
 
 } // namespace
 
@@ -139,6 +143,40 @@ bool load_config(Config& cfg, const std::string& path) {
     if (auto* rtsp = find(root, "rtsp")) {
         cfg.rtsp.server = as_str(find(*rtsp, "server"), cfg.rtsp.server);
         cfg.rtsp.port   = as_int(find(*rtsp, "port"), cfg.rtsp.port);
+    }
+    // ---- AI branch (spec 18): all parameters configurable, none hard-coded ----
+    if (auto* n = find(root, "ai")) {
+        cfg.ai.enable       = as_bool(find(*n, "enable"), cfg.ai.enable);
+        cfg.ai.fps          = as_int(find(*n, "fps"), cfg.ai.fps);
+        cfg.ai.confidence   = as_float(find(*n, "confidence"), cfg.ai.confidence);
+        cfg.ai.model        = as_str(find(*n, "model"), cfg.ai.model);
+        cfg.ai.input_width  = as_int(find(*n, "input_width"), cfg.ai.input_width);
+        cfg.ai.input_height = as_int(find(*n, "input_height"), cfg.ai.input_height);
+        cfg.ai.queue_size   = as_int(find(*n, "queue_size"), cfg.ai.queue_size);
+        cfg.ai.nms_threshold   = as_float(find(*n, "nms_threshold"), cfg.ai.nms_threshold);
+        cfg.ai.match_threshold = as_float(find(*n, "match_threshold"), cfg.ai.match_threshold);
+        cfg.ai.track_buffer    = as_int(find(*n, "track_buffer"), cfg.ai.track_buffer);
+        cfg.ai.low_confidence  = as_float(find(*n, "low_confidence"), cfg.ai.low_confidence);
+        cfg.ai.full_rate_below_fps =
+            as_int(find(*n, "full_rate_below_fps"), cfg.ai.full_rate_below_fps);
+        cfg.ai.log_objects = as_bool(find(*n, "log_objects"), cfg.ai.log_objects);
+        cfg.ai.num_threads = as_int(find(*n, "num_threads"), cfg.ai.num_threads);
+    }
+    // ---- Metadata upload (Phase 2 / spec 9): server address is never hard-coded
+    if (auto* n = find(root, "metadata")) {
+        cfg.metadata.enable        = as_bool(find(*n, "enable"), cfg.metadata.enable);
+        cfg.metadata.server_url    = as_str(find(*n, "server_url"), cfg.metadata.server_url);
+        cfg.metadata.camera_id     = as_str(find(*n, "camera_id"), cfg.metadata.camera_id);
+        cfg.metadata.version       = as_int(find(*n, "version"), cfg.metadata.version);
+        cfg.metadata.queue_size    = as_int(find(*n, "queue_size"), cfg.metadata.queue_size);
+        cfg.metadata.timeout_ms    = as_int(find(*n, "timeout_ms"), cfg.metadata.timeout_ms);
+        cfg.metadata.retry_interval_ms =
+            as_int(find(*n, "retry_interval_ms"), cfg.metadata.retry_interval_ms);
+        cfg.metadata.retry_max_interval_ms =
+            as_int(find(*n, "retry_max_interval_ms"), cfg.metadata.retry_max_interval_ms);
+        cfg.metadata.heartbeat_interval_sec =
+            as_int(find(*n, "heartbeat_interval_sec"), cfg.metadata.heartbeat_interval_sec);
+        cfg.metadata.log_payload = as_bool(find(*n, "log_payload"), cfg.metadata.log_payload);
     }
     cfg.device_id = as_str(find(root, "device_id"), cfg.device_id);
     cfg.log_level = as_str(find(root, "log_level"), cfg.log_level);

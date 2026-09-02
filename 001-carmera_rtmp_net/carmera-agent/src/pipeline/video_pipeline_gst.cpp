@@ -11,14 +11,18 @@
 #include "camera_agent/logger.h"
 
 #include <gst/gst.h>
+#include <gst/app/gstappsink.h>
+#include <gst/video/video.h>
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace ca {
 
@@ -227,10 +231,17 @@ public:
         const std::string enc_elem = (p.encoder == "h264" || p.encoder == "x264")
                                      ? pick_encoder() : p.encoder;
 
-        const char* required[] = {
+        // AI branch requested? Then the tee/appsink elements must exist too.
+        // It is decided here (before the description is assembled) and only
+        // appends to the end of the string - with AI off the description is
+        // byte-identical to the pre-AI pipeline.
+        const bool with_ai = static_cast<bool>(ai_sink_);
+
+        std::vector<const char*> required = {
             src.c_str(), "videoconvert", enc_elem.c_str(),
             "h264parse", "rtspclientsink"
         };
+        if (with_ai) required.push_back("appsink");
         for (const char* e : required) {
             if (!element_available(e)) {
                 CA_LOG_ERROR("Required GStreamer element '{}' is not installed.", e);
@@ -263,7 +274,32 @@ public:
              ",height=" + std::to_string(p.height) +
              ",framerate=" + std::to_string(p.fps) + "/1");
 
-        const std::string desc =
+        // ---- AI branch (spec 2 / 5) ----------------------------------------
+        // Tapped AFTER the (optional) caps filter, so the box coordinates the
+        // detector produces are in exactly the same pixel space the video
+        // pipeline encodes - no second capture device, no re-open of /dev/video.
+        //
+        //   queue leaky=upstream      : never back-pressure the video branch;
+        //                               a full queue drops the OLDEST frame.
+        //   appsink drop=true         : never blocks the streaming thread
+        //                               either; the AI pipeline simply sees the
+        //                               newest frame when it is ready.
+        //   sync=false                : no clock waiting inside the sink.
+        //
+        // The AI branch runs at the FULL camera rate and is sub-sampled by
+        // AIPipeline (5 fps by default). Frames are delivered at the camera's
+        // native resolution in RGB; letterboxing to the network input size is
+        // done in the detector so the bbox inverse-transform stays exact.
+        const std::string ai_branch =
+            with_ai ? (" aisplit."
+                       " ! queue name=aiq max-size-buffers=2 max-size-bytes=0"
+                         " max-size-time=0 leaky=upstream"
+                       " ! videoconvert name=aiconv"
+                       " ! video/x-raw,format=RGB"
+                       " ! appsink name=aisink max-buffers=1 drop=true sync=false")
+                    : "";
+
+        std::string desc =
             src + " name=cam" +
             (src == "mfvideosrc" || src == "dshowvideosrc" || src == "ksvideosrc"
                  ? " device-index=" + std::to_string(p.camera_id) : "") +
@@ -273,11 +309,13 @@ public:
             (src == "videotestsrc" ? " is-live=true" : "") +
             " ! " + q +
             " ! videoconvert name=conv" + conv_out +
+            (with_ai ? " ! tee name=aisplit" : "") +
             " ! " + q +
             " ! " + encoder_element(enc_elem, p.bitrate, p.keyframe_interval) +
             " ! " + q +
             " ! h264parse name=parse" +
-            " ! rtspclientsink name=sink location=" + rtsp_url + " latency=0 rtx-time=0";
+            " ! rtspclientsink name=sink location=" + rtsp_url + " latency=0 rtx-time=0"
+            + ai_branch;
 
         if (p.auto_res)
             CA_LOG_INFO("Auto-resolution: not forcing caps; camera negotiates native format");
@@ -302,6 +340,25 @@ public:
                 gst_object_unref(srcpad);
             }
             gst_object_unref(enc);
+        }
+
+        // ---- AI frame supply: hook the appsink ------------------------------
+        // The frame counter restarts with every (re)build: it is a per-stream
+        // camera frame counter (spec 13).
+        ai_frame_id_ = 0;
+        if (with_ai) {
+            GstElement* as = gst_bin_get_by_name(GST_BIN(pipeline_), "aisink");
+            if (!as) {
+                CA_LOG_ERROR("AI branch: element 'aisink' not found; AI disabled");
+            } else {
+                // Callback API instead of signals: no marshal overhead, and the
+                // callback simply moves the frame into the AI queue.
+                GstAppSinkCallbacks cbs{};
+                cbs.new_sample = &GstVideoPipeline::ai_new_sample_cb;
+                gst_app_sink_set_callbacks(GST_APP_SINK(as), &cbs, this, nullptr);
+                gst_object_unref(as);
+                CA_LOG_INFO("AI branch attached: tee -> leaky queue -> RGB appsink");
+            }
         }
 
         // ---- Opt-in latency probes (capture / encode / push) ----
@@ -520,6 +577,68 @@ private:
         read_pad("enc", "sink");
     }
 
+    // ---- AI branch ---------------------------------------------------------
+    // Runs on the GStreamer streaming thread. Contract: never block, never
+    // throw, never touch anything but the frame -> queue hand-off. A slow or
+    // broken detector therefore cannot stall capture/encode/push (spec 3.1).
+    static GstFlowReturn ai_new_sample_cb(GstAppSink* sink, gpointer user) {
+        GstSample* sample = gst_app_sink_pull_sample(sink);
+        if (!sample) return GST_FLOW_OK;
+        static_cast<GstVideoPipeline*>(user)->on_ai_sample(sample);
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
+    void on_ai_sample(GstSample* sample) {
+        if (!ai_sink_) return;
+
+        GstBuffer* buf  = gst_sample_get_buffer(sample);
+        GstCaps*   caps = gst_sample_get_caps(sample);
+        if (!buf || !caps) return;
+
+        GstVideoInfo info;
+        if (!gst_video_info_from_caps(&info, caps)) return;
+        const int w = GST_VIDEO_INFO_WIDTH(&info);
+        const int h = GST_VIDEO_INFO_HEIGHT(&info);
+        if (w <= 0 || h <= 0) return;
+
+        GstMapInfo map;
+        if (!gst_buffer_map(buf, &map, GST_MAP_READ)) return;
+
+        AIFrame f;
+        // spec 13: monotonic CAMERA frame counter. The tee sees every captured
+        // frame, so this counts real frames - not AI results.
+        f.frame_id = ++ai_frame_id_;
+        // spec 14: timestamp from the GStreamer PTS (ns -> ms), NOT time(NULL).
+        if (GST_BUFFER_PTS_IS_VALID(buf))
+            f.timestamp = static_cast<uint64_t>(GST_BUFFER_PTS(buf) / GST_MSECOND);
+        f.width  = w;
+        f.height = h;
+
+        // Copy plane 0 row by row: RGB rows may be 4-byte aligned, so the
+        // stride can exceed width*3. The AI pipeline wants tightly packed data.
+        const gint   stride = GST_VIDEO_INFO_PLANE_STRIDE(&info, 0);
+        const size_t row    = static_cast<size_t>(w) * 3u;
+        const uint8_t* src  = map.data + GST_VIDEO_INFO_PLANE_OFFSET(&info, 0);
+        if (stride > 0 && map.size >= static_cast<gsize>(stride) * h) {
+            f.rgb.resize(row * static_cast<size_t>(h));
+            for (int y = 0; y < h; ++y) {
+                std::memcpy(f.rgb.data() + static_cast<size_t>(y) * row,
+                            src + static_cast<size_t>(y) * stride, row);
+            }
+            gst_buffer_unmap(buf, &map);
+            try {
+                ai_sink_(std::move(f));
+            } catch (const std::exception& e) {
+                CA_LOG_WARN("[AI] frame sink threw: {}", e.what());
+            } catch (...) {
+                CA_LOG_WARN("[AI] frame sink threw an unknown exception");
+            }
+        } else {
+            gst_buffer_unmap(buf, &map);
+        }
+    }
+
     static GstPadProbeReturn probe_cb(GstPad*, GstPadProbeInfo* info, gpointer user) {
         auto* self = static_cast<GstVideoPipeline*>(user);
         GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
@@ -611,6 +730,10 @@ private:
     // Negotiated capture format (filled by query_negotiated()).
     int  neg_w_ = 0, neg_h_ = 0, neg_fps_ = 0;
     bool neg_valid_ = false;
+
+    // AI branch: camera frame counter (spec 13). The tee feeds every frame, so
+    // this is a true captured-frame counter, independent of the AI rate.
+    uint64_t ai_frame_id_ = 0;
 
     mutable std::mutex stats_mtx_;
     Statistics    stats_{};

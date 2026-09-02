@@ -25,8 +25,27 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 
+# ---- PATHEXT ---------------------------------------------------------------
+# Some non-interactive hosts (CI, sandboxes, scheduled tasks) start PowerShell
+# with a stripped PATHEXT (observed: ".CPL" only). PowerShell uses PATHEXT to
+# decide whether a file is an *application* or a *document*: with .EXE missing,
+# `& some.exe | ...` fails with "Cannot run a document in the middle of a
+# pipeline", and an un-piped call silently does nothing. That turns the whole
+# build into a silent no-op, so restore the standard list before doing anything.
+if ($env:PATHEXT -notmatch '\.EXE') {
+    $env:PATHEXT = '.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL'
+}
+
+# ---- Program Files root ---------------------------------------------------
+# %ProgramFiles(x86)% is EMPTY in some non-interactive hosts (CI, sandboxes,
+# scheduled tasks). Fall back to the well-known path instead of silently
+# producing "\Microsoft Visual Studio\Installer\vswhere.exe".
+$Pf86 = ${env:ProgramFiles(x86)}
+if (-not $Pf86 -or -not (Test-Path $Pf86)) { $Pf86 = 'C:\Program Files (x86)' }
+if (-not (Test-Path $Pf86)) { throw "Program Files (x86) not found (tried '$Pf86')." }
+
 # ---- Locate the Visual Studio installation -------------------------------
-$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$vswhere = Join-Path $Pf86 'Microsoft Visual Studio\Installer\vswhere.exe'
 $VsPath = $null
 if (Test-Path $vswhere) {
     $VsPath = & $vswhere -latest -products * `
@@ -46,7 +65,7 @@ $Cl = Join-Path $Vc 'bin\Hostx64\x64\cl.exe'
 if (-not (Test-Path $Cl)) { throw "cl.exe not found at '$Cl'." }
 
 # ---- Newest Windows SDK ---------------------------------------------------
-$Kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
+$Kits = Join-Path $Pf86 'Windows Kits\10'
 if (-not (Test-Path $Kits)) { throw "Windows 10 SDK not found at '$Kits'." }
 $Sdk = Get-ChildItem (Join-Path $Kits 'Include') -Directory |
        Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |

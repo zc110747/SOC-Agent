@@ -3,7 +3,9 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 
+#include "camera_agent/ai/ai_types.h"
 #include "camera_agent/types.h"
 
 namespace ca {
@@ -59,6 +61,21 @@ public:
 
     // (SIM only) Simulate loss of the RTSP link to exercise reconnect logic.
     virtual void simulate_link_lost() {}
+
+    // ---- AI branch (spec 2 / 3 / 5) ----------------------------------------
+    // Hand the pipeline a sink for raw RGB frames. Must be called BEFORE
+    // build(): the GStreamer backend then taps the video graph with a `tee`.
+    // The callback runs on the GStreamer streaming thread and MUST NOT block -
+    // it is only allowed to move the frame into the AI pipeline's queue.
+    //
+    // When no sink is registered the pipeline description is byte-for-byte what
+    // it was before AI existed, so disabling AI can never regress the video path.
+    virtual void set_ai_sink(std::function<void(AIFrame&&)> cb) {
+        ai_sink_ = std::move(cb);
+    }
+
+protected:
+    std::function<void(AIFrame&&)> ai_sink_;
 };
 
 } // namespace ca

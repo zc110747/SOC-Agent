@@ -21,8 +21,30 @@ Windows PC 摄像头 → GStreamer → H.264 → RTSP 推流，模拟未来 RK35
 - `rtspclientsink` 自带 RTP payloader，管线里不要串 `rtph264pay`。
 
 ## 验收
-- 单测 10/10；端到端 `scripts/e2e-test.ps1`（MediaMTX 收流 + ffmpeg 拉帧 + 断服重连 + auto-resume）。
+- 单测 **22/22**（10 基础 + 3 AI + 9 Metadata）；端到端 `scripts/e2e-test.ps1`
+  （MediaMTX 收流 + ffmpeg 拉帧 + 断服重连 + auto-resume）。
 - auto-resume 判定读 mediamtx.log（实时刷盘），不读 agent.log（stdout 缓冲陈旧）。
+- Metadata 验收用 `scripts/metadata-mock-server.py`（仅标准库；`--dump` / `--fail-after N` / `--die-after N`）。
+
+## AI 分支（Phase 1）与 Metadata 分支（Phase 2）铁律
+- **两条铁律**：AI 异常不能断视频；Metadata 异常既不能断视频也不能阻塞 AI 线程。
+- AI 线程里 `push_result()` 只做「编码 + 短锁入队 + notify」，**绝不联网**；阻塞工作全在发送线程。
+- 队列一律**有界、丢最老保最新**；Metadata 在**离线退避窗内直接丢弃**（不过时数据无价值），
+  所以断服时队列不膨胀。
+- `StreamController` 里 `meta_` 声明在 `ai_` **之前**，保证析构时消费者比生产者活得久。
+- 协议：`{version,type,camera_id,frame_id,timestamp,video_width,video_height,objects[{class,confidence,track_id,bbox[x1,y1,x2,y2]}]}`；
+  `type` 区分 `frame` / `status`（心跳）。`frame_id`/`timestamp` **必须原样拷贝自 AIFrameResult，禁止重新生成**。
+- 服务端地址必须可配（`metadata.server_url` / `--metadata-url`），**禁止硬编码**。
+
+## WinHTTP 惰性连接（踩过的大坑）
+- `WinHttpConnect` 对不存在的端口也返回成功，所以 `transport->connected()` 在服务端已挂时仍是 true。
+  **断连只能在 `send()` 往返失败时发现**。
+- 因此重连状态机必须**由往返结果驱动**：`send()` 失败 → 置 `offline_` + 起退避窗；
+  首次成功后 `offline_` 由真变假才 `++reconnect_` 并打 `connection restored`；
+  用 `ever_connected_` 区分"首次连上"与"断后恢复"。
+- 对外暴露的 `stats().connected` 要取 `transport->connected() && !offline_`。
+- 该回归由单测 `metadata_reconnect_counted_on_recovery` 锁定（用 `connect()` 永不失败的
+  `FlakyTransport` 注入 3 次 send 失败，断言 `reconnect==1 && failed==3`）。
 
 ## 一键启动 / 目录约定（2026-08-31 新增）
 - 根目录 `start-camera-agent.bat`：一键启动脚本（纯英文 .bat）。

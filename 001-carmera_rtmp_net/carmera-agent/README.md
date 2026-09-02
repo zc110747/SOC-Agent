@@ -15,7 +15,7 @@ Windows PC
   -> ffplay / 任意 RTSP 客户端
 ```
 
-本项目只负责：**摄像头采集 · 视频编码 · RTSP 推流 · 设备状态 · 自动重连 · 配置管理**。
+本项目只负责：**摄像头采集 · 视频编码 · RTSP 推流 · 设备状态 · 自动重连 · 配置管理 · 端侧 AI 推理（人检测 + 跟踪，可选） · AI 结果上报（Metadata，可选）**。
 **不**实现 RTSP Server / Web Server / Web UI / WebRTC / 数据库 / 用户管理 / 视频转发。
 
 ---
@@ -54,19 +54,26 @@ camera-agent/
 ├── config/camera-agent.yaml  # YAML 配置（可选，CLI 优先）
 ├── include/camera_agent/     # 公共头：types / config / camera_manager /
 │                             #   video_pipeline / rtsp_publisher / stream_controller / backoff / logger
+│                             #   ai/{ai_types,detector,tracker,ai_pipeline}.h
 ├── src/
 │   ├── main.cpp              # CLI 解析 + 运行循环 + SIGINT 优雅退出
 │   ├── camera/               # camera_manager_sim.cpp / camera_manager_gst.cpp
 │   ├── pipeline/             # video_pipeline_sim.cpp / video_pipeline_gst.cpp
 │   ├── rtsp/                 # rtsp_publisher_sim.cpp / rtsp_publisher_gst.cpp
+│   ├── ai/                   # yolo_detector.cpp (ORT) / byte_tracker.cpp / ai_pipeline.cpp
+│   ├── metadata/             # metadata_encoder.cpp / metadata_manager.cpp
+│   │                         #   / http_transport_winhttp.cpp (WinHTTP，无额外依赖)
 │   ├── config/config.cpp     # 极简 YAML 解析（无额外依赖）
 │   └── common/stream_controller.cpp  # 编排 + 自动重连
-├── tests/                    # 轻量测试框架 + 10 个用例（强制 SIM 后端，可无头运行）
+├── third_party/
+│   └── stb_image.h           # 单元测试用的单头 JPEG/PNG 解码（仅 tests 链接）
+├── tests/                    # 轻量测试框架 + 22 个用例（强制 SIM 后端，可无头运行）
 │   └── finished/             # 运行/验证产物（日志、抓帧）落此处，已 gitignore
 └── scripts/
     ├── build-msvc.ps1        # MSVC + Ninja 构建（推荐，原生 PowerShell）
     ├── build.ps1             # MSVC (Visual Studio 生成器，本机不可用，见下)
     ├── e2e-test.ps1          # 端到端验收（MediaMTX + 拉帧 + 断服重连 + auto-resume）
+    ├── metadata-mock-server.py  # Metadata 验收用假服务端（仅标准库，可随时 kill 测重连）
     └── probe-*.ps1           # 历史调试探针脚本（排查延迟/链路各段，见调试章节）
 ```
 
@@ -79,6 +86,8 @@ camera-agent/
 - **MediaMTX**（RTSP Server）：`mediamtx.exe` 加入 `PATH`。
 - **ffmpeg/ffplay**（仅验证/观看用）：加入 `PATH`。
 - 依赖仅 `spdlog`（CMake `FetchContent` 自动拉取），无其他第三方依赖。
+- **可选**——**ONNX Runtime 1.x（Windows x64 CPU）**：AI 分支加载 `.onnx` 模型用。未安装时 AI 自动停用，编出 `NullDetector`，视频链路不受影响。`include\` + `lib\` 即可；运行时 DLL 由 CMake `POST_BUILD` 自动拷到 exe 旁。CMake 按 `-DONNXRUNTIME_ROOT` → `$ENV{ONNXRUNTIME_ROOT}` → `D:/Software/onnxruntime` → `C:/onnxruntime` → 其他通用前缀顺序定位。
+- **可选**——YOLO 模型（`yolov8n.onnx`，约 12.3 MB）：放在项目根 `models/` 下；路径可在 `ai.model` 配置或 `--ai-model` 覆盖。
 
 > 外部工具一律按**裸名称**调用，因此必须在本机 `PATH` 上。双击 `.bat` 时继承的是注册表里的系统/用户 PATH，**不是**已开终端的 PATH —— 改完 PATH 要重开终端才生效。
 
@@ -152,6 +161,36 @@ device_id: camera01
 log_level: info
 # source: mfvideosrc   # 可选；等同 --source
 # measure_latency: true # 可选；等同 --latency-probe
+
+# ---- AI 分支（与视频链路完全独立；ai.enable=false 时管线字符串逐字节不变）----
+ai:
+  enable: false                # 启用人检测 + ByteTrack 跟踪
+  fps: 5                       # 推理率（源 fps < full_rate_below_fps 时改为每帧都算）
+  confidence: 0.5              # 检测+跟踪门限
+  model: models/yolov8n.onnx   # ONNX 模型路径（相对工作目录）
+  input_width: 640
+  input_height: 640
+  queue_size: 2                # 有界队列；满了丢最老帧保最新
+  nms_threshold: 0.45
+  match_threshold: 0.8         # ByteTrack 首次关联 IoU 门限
+  track_buffer: 30             # 丢失轨迹保留时长（按 30fps 折算）
+  low_confidence: 0.1          # 检测器底门槛（ByteTrack 二阶段用）
+  full_rate_below_fps: 10      # 源 fps 低于此值则每帧都跑
+  log_objects: true            # 每帧打印检出对象
+  num_threads: 2               # ONNX Runtime intra-op 线程
+
+# ---- Metadata 分支（Phase 2：AI 结果异步上报；失败绝不影响视频/AI）----
+metadata:
+  enable: false                                  # 启用结果上报
+  server_url: http://127.0.0.1:8000/api/metadata # 服务端地址（必须配置，禁止硬编码）
+  camera_id: camera01                            # 上报用的摄像头标识
+  version: 1                                     # 协议版本，随每条消息发出
+  queue_size: 8                                  # 有界队列（5~10）；满了丢最老的
+  timeout_ms: 2000                               # 单次 HTTP 超时
+  retry_interval_ms: 1000                        # 重连退避起始值
+  retry_max_interval_ms: 30000                   # 退避上限（指数增长封顶）
+  heartbeat_interval_sec: 10                     # AI 状态心跳周期（0 = 关闭）
+  log_payload: false                             # DEBUG 打印完整 JSON（默认关）
 ```
 
 ### MediaMTX（`mediamtx.yml`）
@@ -191,6 +230,21 @@ MediaMTX 从项目根目录启动时会自动加载本文件。`all_others` + �
 | `--duration <sec>` | 0 | 自动退出秒数（0 = 直到 Ctrl+C） |
 | `--log-level <lvl>` | info | trace/debug/info/warn/error |
 | `--latency-probe` | - | 测量 camera-agent 内部分段延迟（capture→encode→push） |
+| `--ai` / `--no-ai` | `--no-ai` | 启/停 AI 分支（人检测 + 跟踪） |
+| `--ai-fps <n>` | 5 | AI 推理率（`source fps < full_rate_below_fps` 时改为每帧） |
+| `--ai-confidence <f>` | 0.5 | 检测+跟踪置信度门限 |
+| `--ai-model <path>` | `models/yolov8n.onnx` | ONNX 模型路径 |
+| `--ai-input <w> <h>` | 640 640 | 网络输入尺寸 |
+| `--ai-queue <n>` | 2 | 有界队列深度 |
+| `--ai-full-rate-below <n>` | 10 | 源 fps 低于此值时改为每帧都跑 |
+| `--ai-log-objects` | on | 每帧打印检出对象 |
+| `--metadata` / `--no-metadata` | `--no-metadata` | 启/停 Metadata 上报分支 |
+| `--metadata-url <url>` | `http://127.0.0.1:8000/api/metadata` | 服务端地址 |
+| `--metadata-camera-id <id>` | `camera01` | 上报用摄像头标识 |
+| `--metadata-queue <n>` | 8 | 有界队列深度（5~10） |
+| `--metadata-timeout <ms>` | 2000 | 单次 HTTP 超时 |
+| `--metadata-heartbeat <s>` | 10 | AI 状态心跳周期（0 = 关闭） |
+| `--metadata-log-payload` | off | DEBUG 打印完整 JSON |
 | `--version` / `--help` | - | 版本 / 帮助 |
 
 ### 典型命令
@@ -210,6 +264,14 @@ camera-agent --auto --bitrate 2000 --server 192.168.1.100 --port 8554 --stream c
 
 # 内部延迟探针（实测约 20ms，见验证章节）
 camera-agent --auto --source mfvideosrc --latency-probe --duration 8
+
+# AI 启用人检测（独立线程，5 fps，视频不受影响）
+camera-agent --ai --width 1280 --height 720 --fps 30 --duration 30
+
+# AI + Metadata 上报（另开一个终端跑假服务端）
+python scripts/metadata-mock-server.py --port 8000
+camera-agent --ai --metadata --metadata-url http://127.0.0.1:8000/api/metadata \
+             --metadata-camera-id camera01 --metadata-heartbeat 10 --duration 30
 ```
 
 ### 一键启动（demo：MediaMTX + agent + ffplay）
@@ -246,7 +308,7 @@ ctest --test-dir build-msvc --output-on-failure
 ctest --test-dir build --output-on-failure
 ```
 
-覆盖：摄像头枚举、管线创建、H264 编码、RTSP 连接、RTSP 断开、自动重连（退避 `1/2/5/10s` 封顶验证）、参数错误、正常退出。**10/10 通过**。
+覆盖：摄像头枚举、管线创建、H264 编码、RTSP 连接、RTSP 断开、自动重连（退避 `1/2/5/10s` 封顶验证）、参数错误、正常退出、AI 端到端（detector 真图检出 + ByteTrack 稳定 ID + AIPipeline 生命周期）、Metadata 端到端（JSON 字段与 bbox 裁剪、空结果、心跳、有界队列、断服不阻塞、恢复后重连计数、配置解析）。**22/22 通过**。
 
 ### 2. 端到端验收（`scripts/e2e-test.ps1`，真实 GStreamer 后端）
 
@@ -293,6 +355,29 @@ camera-agent --auto --source mfvideosrc --duration 8 --log-level info
 [info] Status: STREAMING -> rtsp://127.0.0.1:8554/camera01
 frames=47 dropped=0 ... status=STREAMING   # 8s 内 ~8fps 稳定，0 dropped
 ```
+
+### 5. Metadata 分支验收（Phase 2）
+
+假服务端（仅标准库，可随时 kill 模拟断服）：
+
+```bash
+python scripts/metadata-mock-server.py --port 8000          # 每行一条摘要
+python scripts/metadata-mock-server.py --port 8000 --dump   # 打印完整 JSON
+python scripts/metadata-mock-server.py --port 8000 --fail-after 20   # 第 20 条后回 500
+python scripts/metadata-mock-server.py --port 8000 --die-after 20    # 第 20 条后进程退出
+curl http://127.0.0.1:8000/            # 查看累计条数 / uptime
+```
+
+| # | 场景 | 做法 | 通过判据 |
+|---|------|------|----------|
+| 1 | 正常上报 | 起 mock + `camera-agent --ai --metadata --duration 15` | mock 收到 ~5 msg/s；`sent` 单调增，`failed=0 dropped=0`，`latency≈1ms` |
+| 2 | 服务端停止 | 运行中 kill 掉 mock | 视频仍 `STREAMING` 且 `dropped=0`；AI 仍 `fps≈5.0`；日志只出 `[METADATA] send failed` + `reconnecting in Nms`，agent 不退出 |
+| 3 | 网络/端口不可达 | `--metadata-url http://127.0.0.1:1/...` 启动 | 同上；队列恒 ≤ `queue_size`，`dropped` 增长（丢最老），不无限膨胀 |
+| 4 | 服务端恢复 | 断服 20s 后重启 mock | `sent` 自动恢复增长，`failed/dropped` 冻结；`reconnect` +1，日志出 `[METADATA] connection restored` |
+| 5 | AI 异常 | 模型路径故意填错后 `--ai --metadata` | 视频正常；AI 不产出结果 → 只剩心跳；agent 不退出 |
+| 6 | AI 关闭 | `--no-ai --metadata` | 视频正常；metadata 只发心跳（或 `--metadata-heartbeat 0` 时静默） |
+
+已实测记录见文末「Metadata 分支」章节的验收表。
 
 ---
 
@@ -351,6 +436,18 @@ frames=47 dropped=0 ... status=STREAMING   # 8s 内 ~8fps 稳定，0 dropped
 
 > 这些脚本多硬编码本机工具路径（如 `D:\data\agent-tools\...`），是一次性排查用途，不保证可移植；正式流程以 `e2e-test.ps1` / `--latency-probe` / `--auto` 为准。
 
+### F. Metadata 分支坑（Phase 2）
+
+| 现象 | 根因 | 修复 |
+|------|------|------|
+| 服务端已挂，`reconnect` 仍为 0、无 `connection restored` 日志 | **WinHTTP 惰性连接**：`WinHttpConnect` 对不存在的端口也返回成功，`connected()` 一直是 true；断连只在 `send()` 往返失败时暴露 | 重连状态机改由**往返结果**驱动：`send()` 失败 → `register_failure()` 置 `offline_`、起退避窗；首次成功后 `offline_` 由真变假才 `++reconnect_` 并打 `connection restored`。`stats().connected` 取 `transport->connected() && !offline_` |
+| 首次连上就打 `connection restored` | 恢复判定只看 `offline_` 会误伤首次连接 | 加 `ever_connected_`：首次成功打 `connected to <url>`，之后恢复才打 `connection restored` |
+| 断服期间队列涨到几百条 | 早期实现在离线时仍入队 | 退避窗内直接 `++dropped_` 丢弃（过时 metadata 无价值），队列恒 ≤ `queue_size` |
+| `std::clamp` 在 bbox 裁剪上出现 UB | `lo > hi` 时 `std::clamp` 行为未定义（如 `w<=0`） | 自写 `clampi()` 先规整 `hi<lo`，并保证 `x2 ∈ [x1+1, w]` |
+| `RecordingTransport` 编译报 C2365 | 测试替身的成员名 `connected` 与成员函数 `connected()` 冲突 | 成员改名 `up` |
+| mock server 在 agent 退出时打 `ConnectionResetError` 栈 | agent 直接关闭 keep-alive 套接字 | `do_POST` 吞掉 `ConnectionResetError/BrokenPipeError/OSError` |
+| Git Bash 里 `taskkill //PID N //F` 无效（路径转换吃参数），导致"断服窗口"根本没建起来 | MSYS 路径转换 | 改用 `TaskStop` 关后台任务，或在 bash 里 `kill $PID`（进程由 bash 启动） |
+
 ---
 
 ## 状态与日志
@@ -365,7 +462,10 @@ frames=47 dropped=0 ... status=STREAMING   # 8s 内 ~8fps 稳定，0 dropped
 
 程序对以下情况做优雅处理，**不会因普通网络错误崩溃退出**：摄像头不存在/被占用、
 分辨率/FPS 不支持、GStreamer 缺失、编码器缺失（给出明确 `Required GStreamer ... is not installed.`）、
-RTSP Server 不存在、网络断开、服务器断开。断服后进入 `1s → 2s → 5s → 10s`（上限 10s）退避重连，服务器恢复后自动 resume。Ctrl+C 执行：停止采集 → 停止编码 → 停止 RTSP → 释放 GStreamer → 释放摄像头 → 退出。
+RTSP Server 不存在、网络断开、服务器断开。断服后进入 `1s → 2s → 5s → 10s`（上限 10s）退避重连，服务器恢复后自动 resume。Ctrl+C 执行：停止采集 → 停止编码 → 停止 RTSP → 停止 AI → 停止 Metadata 发送线程 → 释放 GStreamer → 释放摄像头 → 退出。
+
+**Metadata 服务端异常**（停止 / 网络不通 / 超时 / JSON 编码失败）走独立通道：只记 `[METADATA] ...` WARN 并按指数退避重试，
+消息按有界队列丢弃，**不影响 AI 线程、不影响视频链路、agent 不退出**。AI 分支异常同理（模型加载失败 / 推理抛异常都只丢帧不退出）。
 
 ---
 
@@ -374,3 +474,255 @@ RTSP Server 不存在、网络断开、服务器断开。断服后进入 `1s →
 - **总端到端延迟 >1s**：camera-agent 内部已优化到 ~20ms，大头在 MediaMTX/ffplay/网络 + 8fps 固有帧间隔（125ms/帧）。下一步可调高 fps、缩短 keyframe_interval（当前 GOP≈3.75s），或进一步压 ffplay/网络缓冲。
 - **固定输出尺寸**：当前自动协商为原生直通（不缩放）。若需统一输出尺寸（如 1280×720），需加 `videoscale` 元素。
 - **枚举择优模式**：当前 `--auto` 为原生直通（取设备默认格式）。如需"自动挑最高分辨率"，可扩展为启动枚举设备 caps 后动态选优（代码中 `--list` 已用 `GstDeviceMonitor`，可复用）。
+
+---
+
+## AI 分支（Phase 1：人检测 + 跟踪，可选）
+
+> **设计铁律**：AI 分支**永远**不破坏视频链路——模型加载失败、推理异常、超时、线程退出都不能让 RTSP 掉帧或 agent 退出。
+
+### 链路
+
+```
+Camera (mfvideosrc 1280x720@30)
+    |
+    +--> videoconvert -> caps -> tee name=aisplit
+                                |                          --> enc -> parse -> rtspclientsink  (视频，30fps)
+                                +--> queue leaky=upstream
+                                     -> videoconvert -> video/x-raw,format=RGB
+                                     -> appsink max-buffers=1 drop=true sync=false
+                                                |
+                                          AI 独立线程
+                                          (AIPipeline::thread_loop)
+                                                |
+                                          YOLOv8n (ORT, 640x640)
+                                                |
+                                          ByteTrack (Kalman 8 状态)
+                                                |
+                                          AIFrameResult
+```
+
+- **AI 拿原始分辨率 RGB**（1280x720），不做缩放；letterbox 在 C++ 里做以保证 bbox 反变换精度。
+- **appsink** 配 `drop=true` + `sync=false` + `max-buffers=1`：流线程永不阻塞；新帧来时旧帧直接丢。
+- **AI 队列** `queue leaky=upstream max-size-buffers=2`：再上层缓冲 2 帧，AI 慢时丢最老的、保最新的。
+- **AI 关闭时管线字符串逐字节不变**（实测对比 `ai-on` vs `ai-off` 两条 `Pipeline:` 行，前缀完全相同），所以 AI 出问题不可能让视频走别的路径。
+
+### 独立线程模型
+
+- `AIPipeline` 自有 `std::thread`：`push_frame()` 上 GStreamer 流线程**只做短锁 + move + notify_one**，从不阻塞，从不抛异常。
+- 子线程在 `process()` 里把 `detector.detect` + `tracker.update` 都包在 try/catch；任何异常 → 记 ERROR、丢一帧、线程继续。
+- 连续失败 ≥10 次才再升 ERROR 一次，避免日志爆炸；线程永不退出。
+- `consecutive_failures_` / `processed_` / `dropped_` / `skipped_` 全部受锁保护，`stats()` 拷贝出快照。
+
+### 采样策略
+
+- 源 fps ≥ `ai.full_rate_below_fps`（默认 10）→ 按 `1000/ai.fps` 等间隔采（如 30fps 源 + 5fps AI = 间隔 200ms → frame_id 间隔约 6，与规范"每 6 帧一次"一致）。
+- 源 fps < 10 → **每帧都跑**（慢速摄像头不被进一步饿死）。
+- 间隔由 `interval_ms_ = 0` 标记；子线程在 `wait_until(due, pred=!running)` 里醒来再取队首。
+
+### 抽象层（方便换 RKNN）
+
+- `IDetector` / `ITracker` / `AIPipeline`（头文件 `include/camera_agent/ai/`），工厂 `create_detector()` / `create_tracker()` 返回实例。
+- 当前 `OnnxYoloDetector` 用 ONNX Runtime C++ API；未来加 `RknnYoloDetector` 只需新加 .cpp + 编译宏切换，**头文件与 StreamController 都不用动**。
+- `ByteTrackTracker` 纯 C++，RK3568 同样可跑（ARM 编译即可）。
+
+### 零外部依赖（除 ONNX Runtime）
+
+为不引入 OpenCV / Eigen / 第三方 linalg，自写：
+
+| 自写模块 | 行数级别 | 说明 |
+|---------|---------|------|
+| 640x640 letterbox + 双线性插值 | ~30 | 保持长宽比 + pad 114 |
+| HWC→CHW + /255 归一化 | ~10 | ONNX 输入 tensor 准备 |
+| 两 layout 自动探测 + sigmoid + cxcywh→xyxy | ~80 | `transposed = d1<d2` |
+| 自实现 IoU + NMS（per-class） | ~50 | 无 OpenCV |
+| 8 状态 Kalman（位置/速度） | ~120 | 2 处非参考实现的偏离：状态用 `[cx,cy,w,h,v...]` 而非 `aspect/height`；匹配用贪心而非 `lapjv` |
+| ByteTrack 二阶段关联 | ~100 | high-score first (fuse_score 1-iou*score) + low-score (IoU 0.5) + 未确认轨迹 (IoU 0.7) |
+
+### 单元测试（无头端到端）
+
+`tests/ai_detector_tests.cpp` 三个用例（已合入 ctest，22/22 总通过）：
+
+- `ai_detector_bus_image`：在 Ultralytics 官方 `bus.jpg` 上跑真模型，断言 ≥1 个 person、bbox 全在 `[0,w]×[0,h]` 内。**实测 4 个 person**。
+- `ai_tracker_stable_ids`：3 帧直线漂移的合成检测 → 1 个稳定 track id。
+- `ai_pipeline_lifecycle`：init → start → 推 5 帧 → 回调收到结果 → stop 全流程不崩。
+
+测试在 ORT 缺失时自动 skip（输出 `[skip] ONNX Runtime not built in`），仍能 pass。
+
+### 真机验证记录
+
+| 场景 | 摄像头 | 结果 |
+|------|--------|------|
+| 1280x720@30，**关 AI** | LRCP USB2.0 | 视频 STREAMING，~4 Mbps，**管线串不含 aisplit/aisink/aiconv/aiq** |
+| 1280x720@30，**开 AI** | LRCP USB2.0 | 视频 STREAMING 17s/511 帧（≈30fps，**0 dropped**），AI 5.0 fps / infer ≈90 ms / track ≈0.01 ms |
+| 同上，画面有人 | LRCP USB2.0 | 20s 内 `id=1 person` 稳定（conf 0.74~0.91），frame_id 间隔 ≈6（30/5），PTS timestamp 单调 |
+| `bus.jpg` 端到端 | 静态图 | 4 个 person + bus，bbox 全部在原图坐标内 |
+
+### 已知边界
+
+- **CPU 推理**：i7-8700 / yolov8n @ 640x640 单次约 80~100 ms；1080p 输入（letterbox 后仍为 640x640）下推理时间一致，但 RGB 拷贝到 AI 线程的开销会随分辨率线性增加（720p 一帧 2.7 MB，30 fps 拷贝 ≈80 MB/s，可忽略）。
+- **不接 GPU**：`onnxruntime` Windows CPU 即可。RK3568 阶段切 `rknn` 后端。
+- **tracker 只支持 class_id 0 (person)**：spec 11 要求不引入 ReID/face recog，因此多类别时多类各自独立跟踪，bbox 共享同一个 track 空间。
+
+---
+
+## Metadata 分支（Phase 2：AI 结果上报，可选）
+
+> **设计铁律**：Metadata 分支**永远**不破坏视频链路，也**永远**不阻塞 AI 线程。
+> Server 挂了、网络断了、发送超时、JSON 编码失败，都只记 WARN 并按退避重试；
+> Camera → GStreamer → H264 → RTSP 必须照常跑，agent 绝不因 metadata 退出。
+>
+> 本阶段**只改 Camera Agent**，不碰 Video Server / MediaMTX / Web / 客户端 / 告警引擎。
+
+### 链路与线程模型
+
+```
+AI 线程                        MetadataManager（独立发送线程）
+  |  push_result()  只做「编码 + 入队」                 |
+  +----------------> [有界队列 size=8，满则丢最老] ------+--> connect/POST
+                             (非阻塞、不联网、不抛异常)        |
+                                                              v
+                                                    IMetadataTransport
+                                                    （当前：WinHTTP POST JSON）
+```
+
+- `push_result()` 跑在 **AI 线程**：只 JSON 编码 + 短锁入队 + `notify_one`，**绝不发起网络请求**。实测对端关闭时 30 次 push 总耗时 <100ms。
+- 发送线程独占全部阻塞工作（连接 / POST / 退避 / 心跳）。
+- 队列有界（`queue_size`，规范 5~10，默认 8），**满则丢最老保最新**；服务端不可达期间退避窗内的消息直接丢弃，**队列不会无限膨胀**。
+- 每一层都 try/catch 隔离；`init()`/`start()` 失败只记 WARN 并继续（视频不受影响）。
+- `StreamController` 里 `meta_` 声明在 `ai_` **之前**，保证析构时消费者比生产者活得久。
+
+### 协议（标准 JSON）
+
+帧消息（`AIFrameResult` 直出）：
+
+```json
+{
+  "version": 1,
+  "type": "frame",
+  "camera_id": "camera01",
+  "frame_id": 15230,
+  "timestamp": 1756773210123,
+  "video_width": 1280,
+  "video_height": 720,
+  "objects": [
+    { "class": "person", "confidence": 0.93, "track_id": 17, "bbox": [812, 210, 1040, 850] }
+  ]
+}
+```
+
+心跳/状态消息（`heartbeat_interval_sec` 周期，默认 10s）：
+
+```json
+{
+  "version": 1,
+  "type": "status",
+  "camera_id": "camera01",
+  "wall_clock": 1756773215000,
+  "ai": {
+    "enable": true, "running": true, "fps": 5.00,
+    "model": "models/yolov8n.onnx", "tracker": "bytetrack",
+    "last_frame_id": 15230, "last_timestamp": 1756773210123, "processed": 99
+  }
+}
+```
+
+关键约束：
+
+| 约束 | 落地方式 |
+|------|----------|
+| `bbox` 用**原始视频像素** `[x1,y1,x2,y2]`，须满足 `0 <= x1 < x2 <= width` | `bbox_json()` 自写 `clampi()` 裁剪；越界框被夹到画面内；退化框强制 `x2 >= x1+1` |
+| **`frame_id` / `timestamp` 必须来自 `AIFrameResult`，发送方不得重新生成** | 编码器原样拷贝（`frame_id` = 摄像头帧计数，`timestamp` = `GST_BUFFER_PTS/GST_MSECOND`）；代码注释已标注该规范条款 |
+| 协议须带 `version` | 每条消息都带，`MetadataConfig.version` 可配（默认 1） |
+| 上报频率 ≈ AI 频率（5/s），**不是 30fps** | 一帧一消息，AI 采样率即上报率 |
+| **空结果也要发**（服务端据此判断 AI 存活） | `objects: []` 照常编码发送 |
+| 服务端地址必须可配，**禁止硬编码** | `metadata.server_url` / `--metadata-url`，无内置兜底地址 |
+| 完整 JSON 只在 DEBUG 打印 | `--metadata-log-payload` 控制，默认关；INFO 只打统计行 |
+
+### Transport 抽象
+
+```cpp
+class IMetadataTransport {
+public:
+    virtual const char* name() const = 0;
+    virtual bool connect()   = 0;
+    virtual void close()     = 0;
+    virtual bool connected() const = 0;
+    virtual bool send(const std::string& payload, int timeout_ms, double* latency_ms) = 0;
+};
+std::unique_ptr<IMetadataTransport> create_metadata_transport(const MetadataConfig&);
+```
+
+- 当前实现：`HttpMetadataTransport`（**WinHTTP**，Windows 系统组件，**零额外依赖**），`POST` + `Content-Type: application/json`，校验 2xx，读完响应体以复用连接，`steady_clock` 测延迟。
+- 非 Windows 目标（未来 RK3568）编译期落到 `NullMetadataTransport`，只新增一个 `http_transport_curl.cpp` 即可切换，**上层与头文件完全不动**。
+- `set_transport()` 允许单测注入替身，无需真服务端即可验证投递路径。
+
+### 重连与退避
+
+- 失败后指数退避：`retry_interval_ms`（默认 1000）起，每次 ×2，封顶 `retry_max_interval_ms`（默认 30000），**永不放弃、永不退出**。
+- 断连判定由**往返结果**驱动（见调试章节 F：WinHTTP 惰性连接，`connect()` 对死端口也返回成功）。
+- 恢复后 `++reconnect_` 并打 `[METADATA] connection restored`；首次连上打 `[METADATA] connected to <url>`，两者用 `ever_connected_` 区分。
+- 恢复成功后立即清零 `failure_streak_` 与 `backoff_ms_`，下次故障从最短退避重新开始。
+
+### 日志与统计
+
+```
+[info]    [METADATA] transport=http(winhttp) url=... queue=8 heartbeat=10s
+[info]    [METADATA] sender started
+[info]    [METADATA] connected to http://127.0.0.1:8000/api/metadata
+[warning] [METADATA] send failed
+[warning] [METADATA] reconnecting in 2000ms (3 consecutive send failures)
+[info]    [METADATA] connection restored
+[info]    [METADATA] fps=5.0 latency=1ms queue=0 sent=286 failed=19 dropped=171 reconnect=1
+```
+
+统计口径（每 1s 滚动窗口算 fps/平均延迟，每 5s 打一行）：
+
+| 字段 | 含义 |
+|------|------|
+| `fps` | 实际成功上报速率（正常 ≈5.0） |
+| `latency` | 单次 HTTP 往返平均耗时（本机 ≈1ms） |
+| `queue` | 当前队列深度（应恒 ≤ `queue_size`） |
+| `sent` / `failed` | 发送成功数 / 尝试过但失败数 |
+| `dropped` | 未尝试即丢弃数（队列满 或 离线退避窗内） |
+| `reconnect` | 断连后成功恢复的次数 |
+
+### 验收记录
+
+| # | 场景 | 结果 |
+|---|------|------|
+| 1 | **正常**：720p@30 + AI 5fps + metadata，15s | 视频 STREAMING（269→390 帧，`dropped=0`，~4 Mbps）；AI `fps=5.0 infer≈80ms`；METADATA `fps=5.0 latency=1ms sent=71 failed=0 dropped=0`；mock 收到 72 条 |
+| 2 | **服务端停止**（kill mock，95s 长跑） | 整个断服期间视频 `STREAMING` 且 `dropped=0`，AI 稳定 `fps≈5.0`；`send failed` + `reconnecting in Nms(1s→2s→4s→…)` 按退避出现；`queue` 恒 ≤8，`dropped` 单调增；agent 未退出 |
+| 3 | **端口不可达**（`http://127.0.0.1:1`） | 同 2；单测断言 30 次 push <100ms（证明 AI 线程不做网络工作）、`queue_size ≤ 3` |
+| 4 | **服务端恢复** | `sent` 自动恢复增长（110→286）、`failed/dropped` 冻结；`reconnect` 计数 +1 并出 `connection restored`（此前因 WinHTTP 惰性连接漏计，已修并由单测 `metadata_reconnect_counted_on_recovery` 锁定） |
+| 5 | **AI 异常** | 模型加载失败 → AI 不产出结果，视频与 agent 正常；metadata 只剩心跳（待补真机复测记录） |
+| 6 | **AI 关闭** | `--no-ai --metadata`：视频正常，metadata 仅发心跳（待补真机复测记录） |
+
+单元测试 **22/22 通过**（13 原有（含 3 个 AI）+ 9 个 Metadata）：
+
+| 用例 | 断言要点 |
+|------|----------|
+| `metadata_encode_frame` | 字段名/顺序全对；`confidence:0.93`；越界框夹成 `[0,0,1920,1080]` |
+| `metadata_encode_empty_frame` | 空结果仍产出 `"objects":[]` 且 `frame_id` 正确 |
+| `metadata_encode_status` | 心跳含 `enable/running/fps/model/tracker/last_frame_id/processed` |
+| `metadata_queue_bounded_when_server_down` | 死端口下 30 次 push <100ms、`queue_size ≤ 3`、`dropped+failed > 0` |
+| `metadata_not_started_is_noop` | 未 start 时 push 静默忽略，计数全 0 |
+| `metadata_config_from_yaml` | 10 个配置项全部来自配置，无硬编码 |
+| `metadata_delivers_objects` | 队列→发送线程→Transport 全链路，`track_id`/`bbox`/`frame_id` 原样送达 |
+| `metadata_reconnect_counted_on_recovery` | 惰性 Transport（`connect()` 永不失败）下注入 3 次失败，`reconnect==1` 且 `failed==3` |
+| `metadata_heartbeat_delivered` | 不发任何帧时心跳仍能送达，含 `"type":"status"` |
+
+### 服务端对接说明（给后续 Video Server）
+
+1. 提供 `POST <server_url>`，`Content-Type: application/json`，返回 **2xx** 即视为成功（非 2xx 会被记为一次失败并触发退避重连）。
+2. 按 `camera_id` 区分设备；`version` 用于协议演进，服务端应容忍未知新增字段。
+3. `type` 字段区分两类消息：`frame`（检测结果）/ `status`（AI 心跳）。心跳中 `ai.running=false` 或长时间无 `frame` 消息 = AI 异常。
+4. `frame_id` 是**摄像头帧计数**（可能因采样不连续），`timestamp` 是**采集端 PTS（ms）**，`wall_clock` 是**发送端墙钟**——服务端做时序判断请用前两者，判断新鲜度用后者。
+5. 上报速率约 5 msg/s/摄像头，服务端按此估算容量；断连期间消息会**主动丢弃**而非补发，服务端不应假设帧序号连续。
+
+### 已知边界 / 后续
+
+- 测试 5（AI 异常）与测试 6（AI 关闭）尚未补齐真机长跑记录，单测层已覆盖等价路径。
+- 当前仅 HTTP 明文；HTTPS 已支持（`WINHTTP_FLAG_SECURE` 按 scheme 自动开），但**未做证书校验配置**，生产接入前需补。
+- 无本地落盘/补发：断网期间的检测结果按规范丢弃（过时 metadata 无价值）。若后续需要离线缓存，应加在 Transport 层，不动队列语义。
+- 单条消息未做批量合并；若服务端希望降频，可在 Encoder 层做 N 帧聚合（当前按规范保持一帧一消息）。

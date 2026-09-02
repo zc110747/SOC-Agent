@@ -41,6 +41,32 @@ static void print_help() {
         "  --duration <sec>   Auto-stop after N seconds (0 = until Ctrl+C)\n"
         "  --log-level <lvl>  trace|debug|info|warn|error (default info)\n"
         "  --latency-probe    Instrument per-stage latency (capture->encode->push)\n"
+        "\n"
+        "AI options (person detection + tracking; independent of the video stream):\n"
+        "  --ai               Enable the AI branch\n"
+        "  --no-ai            Disable the AI branch\n"
+        "  --ai-fps <n>       Inference rate (default 5). Ignored when the source\n"
+        "                      framerate is below --ai-full-rate-below\n"
+        "  --ai-confidence <f> Detection / tracker score gate (default 0.5)\n"
+        "  --ai-model <path>  ONNX model (default models/yolov8n.onnx)\n"
+        "  --ai-input <w> <h> Network input size (default 640 640)\n"
+        "  --ai-queue <n>     Bounded frame queue depth (default 2)\n"
+        "  --ai-full-rate-below <n>\n"
+        "                     Source fps below this -> infer EVERY frame (default 10)\n"
+        "  --ai-log-objects   Log every detected object (default: on)\n"
+        "\n"
+        "Metadata options (async AI result upload; never blocks video or AI):\n"
+        "  --metadata             Enable metadata upload\n"
+        "  --no-metadata          Disable metadata upload\n"
+        "  --metadata-url <url>   Server endpoint (default http://127.0.0.1:8000/api/metadata)\n"
+        "  --metadata-camera-id <id>\n"
+        "                         Camera id reported to the server (default camera01)\n"
+        "  --metadata-queue <n>   Bounded queue depth (default 8)\n"
+        "  --metadata-timeout <ms> Per-request timeout (default 2000)\n"
+        "  --metadata-heartbeat <sec>\n"
+        "                         Status message period, 0 = off (default 10)\n"
+        "  --metadata-log-payload Dump full JSON at debug level\n"
+        "\n"
         "  --version          Show version\n"
         "  --help             Show this help\n";
 }
@@ -90,6 +116,17 @@ int main(int argc, char** argv) {
         int  camera_v=0, width_v=0, height_v=0, fps_v=0, bitrate_v=0, port_v=0;
         double duration_v=0;
         std::string stream_v, server_v, device_v, log_v, config, source_v;
+        // AI overrides (all optional; YAML < CLI as everywhere else)
+        bool ai=false, ai_no=false, ai_fps=false, ai_conf=false, ai_model=false;
+        bool ai_w=false, ai_h=false, ai_queue=false, ai_frb=false, ai_log_objects=false;
+        int  ai_fps_v=0, ai_w_v=0, ai_h_v=0, ai_queue_v=0, ai_frb_v=0;
+        float ai_conf_v=0;
+        std::string ai_model_v;
+        // Metadata overrides
+        bool md=false, md_no=false, md_url=false, md_cam=false, md_queue=false;
+        bool md_timeout=false, md_hb=false, md_log_payload=false;
+        int  md_queue_v=0, md_timeout_v=0, md_hb_v=0;
+        std::string md_url_v, md_cam_v;
     } cli;
 
     auto get_val = [&](int i, const char* opt) -> std::string {
@@ -117,6 +154,36 @@ int main(int argc, char** argv) {
         else if (a == "--source")     { cli.source = true;   cli.source_v = get_val(i++, "--source"); }
         else if (a == "--config")     { cli.config = get_val(i++, "--config"); }
         else if (a == "--duration")   { cli.dur = true;     cli.duration_v = std::atof(get_val(i++, "--duration").c_str()); }
+        else if (a == "--ai")                  cli.ai = true;
+        else if (a == "--no-ai")               cli.ai_no = true;
+        else if (a == "--ai-log-objects")      cli.ai_log_objects = true;
+        else if (a == "--ai-fps")    { cli.ai_fps = true;   cli.ai_fps_v = std::atoi(get_val(i++, "--ai-fps").c_str()); }
+        else if (a == "--ai-confidence") { cli.ai_conf = true;
+                                          cli.ai_conf_v = (float)std::atof(get_val(i++, "--ai-confidence").c_str()); }
+        else if (a == "--ai-model")  { cli.ai_model = true; cli.ai_model_v = get_val(i++, "--ai-model"); }
+        else if (a == "--ai-queue")  { cli.ai_queue = true; cli.ai_queue_v = std::atoi(get_val(i++, "--ai-queue").c_str()); }
+        else if (a == "--ai-full-rate-below") { cli.ai_frb = true;
+                                               cli.ai_frb_v = std::atoi(get_val(i++, "--ai-full-rate-below").c_str()); }
+        else if (a == "--metadata")            cli.md = true;
+        else if (a == "--no-metadata")         cli.md_no = true;
+        else if (a == "--metadata-log-payload") cli.md_log_payload = true;
+        else if (a == "--metadata-url") { cli.md_url = true;
+                                          cli.md_url_v = get_val(i++, "--metadata-url"); }
+        else if (a == "--metadata-camera-id") { cli.md_cam = true;
+                                                cli.md_cam_v = get_val(i++, "--metadata-camera-id"); }
+        else if (a == "--metadata-queue") { cli.md_queue = true;
+                                            cli.md_queue_v = std::atoi(get_val(i++, "--metadata-queue").c_str()); }
+        else if (a == "--metadata-timeout") { cli.md_timeout = true;
+                                              cli.md_timeout_v = std::atoi(get_val(i++, "--metadata-timeout").c_str()); }
+        else if (a == "--metadata-heartbeat") { cli.md_hb = true;
+                                                cli.md_hb_v = std::atoi(get_val(i++, "--metadata-heartbeat").c_str()); }
+        else if (a == "--ai-input") {
+            if (i + 2 >= argc) { CA_LOG_ERROR("Missing value for --ai-input <w> <h>"); }
+            else { cli.ai_w = cli.ai_h = true;
+                   cli.ai_w_v = std::atoi(argv[i + 1]);
+                   cli.ai_h_v = std::atoi(argv[i + 2]);
+                   i += 2; }
+        }
     }
 
     // ---- 2. Precedence: defaults -> YAML -> CLI ----
@@ -141,6 +208,24 @@ int main(int argc, char** argv) {
     if (cli.log)    cfg.log_level       = cli.log_v;
     if (cli.latency) cfg.measure_latency = true;
     if (cli.source)  cfg.source          = cli.source_v;
+    if (cli.ai)      cfg.ai.enable       = true;
+    if (cli.ai_no)   cfg.ai.enable       = false;
+    if (cli.ai_fps)  cfg.ai.fps          = cli.ai_fps_v;
+    if (cli.ai_conf) cfg.ai.confidence   = cli.ai_conf_v;
+    if (cli.ai_model)  cfg.ai.model         = cli.ai_model_v;
+    if (cli.ai_w)      cfg.ai.input_width   = cli.ai_w_v;
+    if (cli.ai_h)      cfg.ai.input_height  = cli.ai_h_v;
+    if (cli.ai_queue)  cfg.ai.queue_size    = cli.ai_queue_v;
+    if (cli.ai_frb)    cfg.ai.full_rate_below_fps = cli.ai_frb_v;
+    if (cli.ai_log_objects) cfg.ai.log_objects = true;
+    if (cli.md)              cfg.metadata.enable       = true;
+    if (cli.md_no)           cfg.metadata.enable       = false;
+    if (cli.md_url)          cfg.metadata.server_url   = cli.md_url_v;
+    if (cli.md_cam)          cfg.metadata.camera_id    = cli.md_cam_v;
+    if (cli.md_queue)        cfg.metadata.queue_size   = cli.md_queue_v;
+    if (cli.md_timeout)      cfg.metadata.timeout_ms   = cli.md_timeout_v;
+    if (cli.md_hb)           cfg.metadata.heartbeat_interval_sec = cli.md_hb_v;
+    if (cli.md_log_payload)  cfg.metadata.log_payload  = true;
     const double duration = cli.dur ? cli.duration_v : 0.0;
 
     ca::log::set_level(cfg.log_level);
