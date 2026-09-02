@@ -54,12 +54,9 @@ set CFG=%ROOT%\config\%CFG_NAME%
 REM Pick the NEWEST video-server*.exe: build.bat writes video-server.new.exe
 REM when the canonical name is locked by a running instance, and running a
 REM stale binary is the last thing you want while debugging playback.
-set "VS_NAME="
-for /f "delims=" %%i in ('dir /b /o-d "%ROOT%\video-server*.exe" 2^>nul') do (
-  if not defined VS_NAME set "VS_NAME=%%i"
-)
-if not defined VS_NAME set "VS_NAME=video-server.exe"
-set VS_EXE=%ROOT%\%VS_NAME%
+REM The pick lives in :pick_exe because it runs twice - once here, once again
+REM after the optional rebuild below.
+call :pick_exe
 set CA_EXE=%AGENT_DIR%\build-msvc\src\camera-agent.exe
 
 echo ============================================================
@@ -92,13 +89,62 @@ for %%a in (%*) do (
 if defined CAMERA_ID   set "CAMERA_ARG=--camera %CAMERA_ID%"
 if defined CAMERA_SOURCE set "SOURCE_ARG=--source %CAMERA_SOURCE%"
 
-REM ---- (1) pre-check project binaries ----
+REM ---- (1) stop leftovers from a previous run --------------------------
+REM FIRST, before anything may write video-server.exe: Windows holds an
+REM exclusive handle on a running .exe, so a rebuild would fail with "Access
+REM is denied" and silently leave the stale binary in place.
+echo [*] Stopping leftovers: video-server / mediamtx / camera-agent
+taskkill /F /IM video-server.exe >nul 2>&1
+taskkill /F /IM camera-agent.exe >nul 2>&1
+taskkill /F /IM mediamtx.exe    >nul 2>&1
+C:\Windows\System32\timeout.exe /t 2 >nul 2>&1
+echo [OK]    stopped
+
+REM ---- (2) rebuild when the sources are newer than the binary -----------
+REM A stale video-server.exe is the most confusing way this script can fail:
+REM every pre-check passes, yet the server runs last week's logic and dies on
+REM something the current sources already fix (a rewritten binary lookup, a
+REM renamed config key, ...). So compare the binary against the newest .go
+REM file under cmd\ and internal\; when the sources win, rebuild.
+REM
+REM The PowerShell text deliberately contains NO "|": cmd does NOT honour the
+REM ^ escape inside double quotes, so "^|" reaches PowerShell as a literal
+REM argument and fails with "positional parameter not found". The newest
+REM source time is found with a loop instead of Sort-Object for that reason.
+REM
+REM Non-fatal by design: if go is missing or the tree does not compile, keep
+REM the existing binary and say so instead of refusing to start at all.
+REM The check runs at TOP LEVEL (goto, not a nested if block) on purpose: inside
+REM a parenthesised block every ")" would need escaping, and "^)" is useless
+REM here because cmd does not strip ^ inside double quotes - the caret would
+REM reach PowerShell and become a syntax error.
+set "VS_STALE="
+where go >nul 2>nul
+if errorlevel 1 goto :no_rebuild
+if not exist "%VS_EXE%" goto :no_rebuild
+for /f "usebackq tokens=*" %%i in (`powershell -NoProfile -Command "$e = Get-Item -LiteralPath '%VS_EXE%'; $g = @(Get-ChildItem -LiteralPath '%ROOT%\cmd', '%ROOT%\internal' -Recurse -Filter '*.go'); $m = $e.LastWriteTime; foreach ($f in $g) { if ($f.LastWriteTime -gt $m) { $m = $f.LastWriteTime } }; if ($m -gt $e.LastWriteTime) { 'STALE' }" 2^>nul`) do set "VS_STALE=%%i"
+:no_rebuild
+if "%VS_STALE%"=="STALE" (
+  echo [BUILD]  sources newer than %VS_NAME% - rebuilding ...
+  pushd "%ROOT%"
+  go build -trimpath -o "%ROOT%\video-server.exe" ./cmd/video-server
+  set "VS_RC=!errorlevel!"
+  popd
+  if "!VS_RC!"=="0" (
+    echo [OK]    rebuilt video-server.exe
+  ) else (
+    echo [WARN]  build failed - continuing with the existing %VS_NAME%
+  )
+  call :pick_exe
+)
+
+REM ---- (3) pre-check project binaries ----
 if not exist "%VS_EXE%" (
   echo [ERROR] video-server.exe not found: %VS_EXE%
   echo         Build it: scripts\build.bat
   goto :fail
 )
-echo [OK]    video-server.exe
+echo [OK]    video-server.exe  binary=%VS_NAME%
 
 if not exist "%CA_EXE%" (
   echo [ERROR] camera-agent.exe not found: %CA_EXE%
@@ -113,7 +159,7 @@ if not exist "%CFG%" (
 )
 echo [OK]    config\%CFG_NAME%
 
-REM ---- (2) read ports out of the server config -------------------------
+REM ---- (4) read ports out of the server config -------------------------
 REM Ports live in one place only - the YAML - so read them back instead of
 REM duplicating the numbers here. Matches on "key: value" and trims spaces.
 REM The first bare "port:" in the file is rtsp.port; server uses http_port.
@@ -130,15 +176,7 @@ for /f "usebackq tokens=1,2 delims=:" %%a in (`findstr /r /c:"^  port:" "%CFG%"`
 )
 echo [OK]    ports: http=%HTTP_PORT% rtsp=%RTSP_PORT%
 
-REM ---- (3) stop leftovers from a previous run --------------------------
-echo [*] Stopping leftovers: video-server / mediamtx / camera-agent
-taskkill /F /IM video-server.exe >nul 2>&1
-taskkill /F /IM camera-agent.exe >nul 2>&1
-taskkill /F /IM mediamtx.exe    >nul 2>&1
-C:\Windows\System32\timeout.exe /t 2 >nul 2>&1
-echo [OK]    stopped
-
-REM ---- (4) start video-server (it spawns MediaMTX) ---------------------
+REM ---- (5) start video-server (it spawns MediaMTX) ---------------------
 echo [1/3] Starting video-server ...
 start "video-server" /D "%ROOT%" cmd /c "video-server.exe config\%CFG_NAME% > "%LOGS%\video-server.log" 2>&1"
 
@@ -155,7 +193,7 @@ if "%READY%"=="0" (
 )
 echo [OK]    video-server healthy on :%HTTP_PORT%
 
-REM ---- (5) pick a camera index that actually exists --------------------
+REM ---- (6) pick a camera index that actually exists --------------------
 REM A wrong index makes GStreamer fail to open the device and the agent exits
 REM immediately, which looks like "nothing happened". Ask the binary.
 if not defined CAMERA_ID (
@@ -175,13 +213,13 @@ if not defined CAMERA_ID (
   set "CAMERA_ARG=--camera !CAMERA_ID!"
 )
 
-REM ---- (6) start camera-agent, pushing at the SAME MediaMTX ------------
+REM ---- (7) start camera-agent, pushing at the SAME MediaMTX ------------
 echo [2/3] Starting camera-agent --auto --stream %STREAM_ID% ...
 set "AGENT_ARGS=%CAMERA_ARG% --stream %STREAM_ID% --server 127.0.0.1 --port %RTSP_PORT% --auto %SOURCE_ARG%"
 echo        args: %AGENT_ARGS%
 start "camera-agent" /D "%AGENT_DIR%" cmd /c ""%CA_EXE%" %AGENT_ARGS% --log-level info > "%LOGS%\agent.log" 2>&1"
 
-REM ---- (7) wait for the server to auto-register the stream -------------
+REM ---- (8) wait for the server to auto-register the stream -------------
 echo [3/3] Waiting for video-server to auto-register %STREAM_ID% ...
 set CONN=0
 for /l %%i in (1,1,30) do (
@@ -196,16 +234,28 @@ if "%CONN%"=="1" (
   echo [WARN]  %STREAM_ID% not registered within 60s - see %LOGS%\agent.log
 )
 
-REM ---- (8) open the Web UI ----
+REM ---- (9) open the Web UI ----
 if "%NO_BROWSER%"=="0" start "" http://localhost:%HTTP_PORT%/
 
 REM ---- summary ----
 REM The server binds 0.0.0.0, so the same port is served on every local
 REM address. Showing the LAN address here saves the usual "which IP do I use"
-REM guesswork - the server prints the full list in logs\video-server.log and
-REM exposes it as GET /api/net/addresses.
+REM guesswork.
+REM
+REM The address is ASKED FROM THE SERVER (GET /api/net/addresses -> public_host)
+REM instead of being recomputed here. The server ranks candidates properly -
+REM real private NIC first, virtual NICs (VMware/WSL/Hyper-V/vEthernet) and
+REM link-local last - so this prints the same IP the RTSP/WebRTC URLs advertise.
+REM A Get-NetIPAddress one-liner would need pipes, and cmd does NOT honour the
+REM ^ escape inside double quotes: "^|" arrives at PowerShell verbatim and
+REM blows up with "positional parameter not found". Reading the API keeps the
+REM command pipe-free (and therefore quote- and escape-free).
 set "LAN_IP="
-for /f "usebackq tokens=*" %%i in (`powershell -NoProfile -Command "(Get-NetIPAddress -AddressFamily IPv4 ^| Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } ^| Sort-Object -Property InterfaceMetric ^| Select-Object -First 1).IPAddress"`) do set "LAN_IP=%%i"
+for /f "usebackq tokens=*" %%i in (`powershell -NoProfile -Command "$r = Invoke-RestMethod -Uri 'http://localhost:%HTTP_PORT%/api/net/addresses'; $r.public_host" 2^>nul`) do set "LAN_IP=%%i"
+
+REM A loopback-only server has no LAN address worth advertising; stay quiet.
+set "SHOW_LAN=0"
+if defined LAN_IP if not "%LAN_IP%"=="127.0.0.1" set SHOW_LAN=1
 
 echo.
 echo ============================================================
@@ -213,8 +263,8 @@ echo  Joint run started
 echo  Web UI      : http://localhost:%HTTP_PORT%/
 echo  REST API    : http://localhost:%HTTP_PORT%/api/cameras
 echo  RTSP stream : rtsp://127.0.0.1:%RTSP_PORT%/%STREAM_ID%
-if defined LAN_IP (
-  echo  --- from another machine on the LAN ---
+if "%SHOW_LAN%"=="1" (
+  echo  --- from another machine on the LAN - source: GET /api/net/addresses ---
   echo  Web UI      : http://%LAN_IP%:%HTTP_PORT%/
   echo  RTSP stream : rtsp://%LAN_IP%:%RTSP_PORT%/%STREAM_ID%
   echo  If it times out, open the firewall first:
@@ -236,4 +286,22 @@ pause
 exit /b 1
 
 :done
+exit /b 0
+
+REM ============================================================================
+REM  :pick_exe - set VS_NAME / VS_EXE to the freshest video-server*.exe
+REM
+REM  dir /o-d lists newest-first. build.bat falls back to video-server.new.exe
+REM  when the canonical name is locked by a running instance, so there can be
+REM  more than one candidate. Called twice: once at startup, once after an
+REM  automatic rebuild. Must stay at top level - a ")" inside a parenthesised
+REM  block needs escaping, and "^" is NOT stripped inside double quotes.
+REM ============================================================================
+:pick_exe
+set "VS_NAME="
+for /f "delims=" %%i in ('dir /b /o-d "%ROOT%\video-server*.exe" 2^>nul') do (
+  if not defined VS_NAME set "VS_NAME=%%i"
+)
+if not defined VS_NAME set "VS_NAME=video-server.exe"
+set VS_EXE=%ROOT%\%VS_NAME%
 exit /b 0

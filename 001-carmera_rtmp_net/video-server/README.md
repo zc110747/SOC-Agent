@@ -111,6 +111,50 @@ scripts\build.bat
 ```
 依次执行：定位 `go`（PATH 或 `.toolchain/go`）→ `npm install` → `npm run build` → `go build -trimpath -o video-server.exe ./cmd/video-server`。
 
+### 4.4 根目录一键脚本（全项目构建 / 单服务启动）
+
+`scripts\build.bat` 只管 video-server 自己；根目录这两个脚本把**整个仓库**串起来：
+
+| 脚本 | 作用 | 覆盖范围 |
+|---|---|---|
+| `build_onelick.bat` | 一次构建整个项目 | Web UI + video-server + carmera-agent |
+| `start_oneclick.bat` | 一键启动 video-server | 只起服务端（它自己拉起 MediaMTX） |
+
+```bat
+build_onelick.bat                  # 全部构建
+build_onelick.bat --skip-web       # 跳过 Web UI
+build_onelick.bat --skip-agent     # 跳过 carmera-agent
+build_onelick.bat --clean          # 清空 web\dist 与 carmera-agent\build-msvc 后重建
+build_onelick.bat --backend sim    # carmera-agent 后端：gstreamer（默认）| sim | auto
+build_onelick.bat --no-pause       # 无人值守（CI），失败也不暂停
+
+start_oneclick.bat                 # 默认 config\config.joint.yaml（8081）
+start_oneclick.bat --config config.yaml    # 文件名或路径都接受
+start_oneclick.bat --no-browser    # 不开浏览器
+start_oneclick.bat --no-kill       # 保留已经在跑的实例
+start_oneclick.bat --no-pause      # 无人值守
+```
+
+**`build_onelick.bat` 的五步与自检**
+
+| 步骤 | 内容 | 失败时 |
+|---|---|---|
+| `[1/5]` preflight | 探测 `go` / `node`+`npm` / Visual Studio（vswhere 或 `D:\Software\vs`） | 缺 `go` 或缺 VS 直接 FAIL；缺 `node` 但 `web\dist` 已存在则 WARN 跳过 |
+| `[2/5]` Web UI | `npm install`（仅缺 `node_modules` 时）→ `npm run build` → 校验 `web\dist\index.html` | **构建失败会自动 `npm install` 后重试一次** |
+| `[3/5]` video-server | `go build -trimpath -o video-server.exe ./cmd/video-server` | 目标被运行实例占用时，自动回退写 `video-server.new.exe` |
+| `[4/5]` carmera-agent | 调用 `carmera-agent\build_oneclick.bat --no-pause [clean] <backend>` | 非 0 退出或产物缺失 → FAIL |
+| `[5/5]` summary | 打印各产物字节数 / mtime，并给出下一步命令 | — |
+
+> 为什么 `[2/5]` 要"失败后重装依赖再试一次"：`node_modules` 存在**只证明曾经装过**，不等于装全。
+> 实测踩过一次 —— `hls.js` 是后加进 `package.json` 的依赖，`node_modules` 还停在旧时间，
+> Vite 直接 `Rollup failed to resolve import "hls.js"`。若不想重装而只想跳过：`--skip-web`。
+
+**两个脚本的统一约定**
+
+- 所有失败路径都 `pause` 并打印 `reason` + `hint`，不会静默退出；CI 用 `--no-pause` 关掉。
+- 退出码：成功 `0`，任何失败 `1`（`--no-pause` 下同样成立）。
+- 脚本内 `.bat` 一律纯英文，避免 GBK 控制台解析问题。
+
 ---
 
 ## 5. 配置（`config/config.yaml`）
@@ -154,6 +198,10 @@ record: false
 
 # 指定配置
 ./video-server.exe path/to/config.yaml
+
+# 或用根目录一键脚本（自动清残留 → 启动 → 等 /api/health → 打印本机与局域网地址）
+start_oneclick.bat                       # 默认 config\config.joint.yaml（8081）
+start_oneclick.bat --config config.yaml  # 换配置
 ```
 启动后服务会：
 1. 打开（必要时创建）SQLite 库与 `camera` 表；
@@ -302,6 +350,19 @@ scripts\stop-joint.bat                   :: 停掉全部（含 MediaMTX 子进�
 > **必须带 `--auto`**：本机 UVC 摄像头原生只支持 **240×240@8fps**，若强制
 > 1280×720@30 会导致 caps 协商失败、流水线进不了 PLAYING、Agent 陷入重连死循环。
 > 两个启动脚本均已默认加上。
+
+**脚本自带的三道自检**（无需手动干预）：
+
+1. **清理残留** —— 先 `taskkill` 掉 video-server / camera-agent / mediamtx。放在最前面，
+   否则 Windows 对运行中的 `.exe` 持有独占句柄，后续重建必然 `Access is denied`。
+2. **二进制过期自动重建** —— 把 `video-server*.exe` 的 mtime 与 `cmd\`、`internal\` 下
+   最新的 `.go` 比较，源码更新就自动 `go build`。这是最有价值的保护：改了 Go 源码却忘了
+   重新构建时，所有预检都会通过，但跑起来的仍是旧逻辑（本次故障正是如此——
+   `findBinary()` 的 PATH 回退已改，exe 却是旧版，于是 `mediamtx binary not found`）。
+   构建失败不致命，会打印 `[WARN]` 并继续使用现有二进制。
+3. **LAN 地址从服务端取** —— 查询 `GET /api/net/addresses` 的 `public_host`，
+   而不是脚本本地重算。服务端会把物理网卡排在 VMware / WSL / Hyper-V / vEthernet
+   等虚拟网卡之前，打印的 IP 与 RTSP、WebRTC URL 里播发的一致。
 
 ### 7.3 端到端验收
 
