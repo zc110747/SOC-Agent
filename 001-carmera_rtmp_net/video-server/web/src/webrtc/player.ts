@@ -110,6 +110,16 @@ export class StreamPlayer {
     }
   }
 
+  /** Cancel only the "no media in WEBRTC_TIMEOUT_MS" watchdog. Used when the
+   *  connection actually established (connectionState 'connected') so we don't
+   *  spuriously fail a working stream. Does NOT touch the reconnect timer. */
+  private clearWatchdog(): void {
+    if (this.watchdog !== null) {
+      window.clearTimeout(this.watchdog)
+      this.watchdog = null
+    }
+  }
+
   // ------------------------------------------------------------------- webrtc
 
   private async connectWebRTC(): Promise<void> {
