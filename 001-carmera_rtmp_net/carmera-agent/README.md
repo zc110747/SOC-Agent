@@ -231,7 +231,7 @@ MediaMTX 从项目根目录启动时会自动加载本文件。`all_others` + �
 | `--log-level <lvl>` | info | trace/debug/info/warn/error |
 | `--latency-probe` | - | 测量 camera-agent 内部分段延迟（capture→encode→push） |
 | `--ai` / `--no-ai` | `--no-ai` | 启/停 AI 分支（人检测 + 跟踪） |
-| `--ai-fps <n>` | 5 | AI 推理率（`source fps < full_rate_below_fps` 时改为每帧） |
+| `--ai-fps <n>` | 8 | AI 推理率，可配范围 5-12（`source fps < full_rate_below_fps` 时改为每帧） |
 | `--ai-confidence <f>` | 0.5 | 检测+跟踪置信度门限 |
 | `--ai-model <path>` | `models/yolo11n.onnx` | ONNX 模型路径（检测/姿态自动识别） |
 | `--ai-input <w> <h>` | 640 640 | 网络输入尺寸 |
@@ -521,7 +521,7 @@ Camera (mfvideosrc 1280x720@30)
 
 ### 采样策略
 
-- 源 fps ≥ `ai.full_rate_below_fps`（默认 10）→ 按 `1000/ai.fps` 等间隔采（如 30fps 源 + 5fps AI = 间隔 200ms → frame_id 间隔约 6，与规范"每 6 帧一次"一致）。
+- 源 fps ≥ `ai.full_rate_below_fps`（默认 10）→ 按 `1000/ai.fps` 等间隔采（默认 8fps AI = 间隔 125ms；如 30fps 源 + 5fps AI = 间隔 200ms → frame_id 间隔约 6，与规范"每 6 帧一次"一致）。`ai.fps` 可配范围 5-12。
 - 源 fps < 10 → **每帧都跑**（慢速摄像头不被进一步饿死）。
 - 间隔由 `interval_ms_ = 0` 标记；子线程在 `wait_until(due, pred=!running)` 里醒来再取队首。
 

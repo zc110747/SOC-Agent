@@ -45,8 +45,9 @@ static void print_help() {
         "AI options (person detection + tracking; independent of the video stream):\n"
         "  --ai               Enable the AI branch\n"
         "  --no-ai            Disable the AI branch\n"
-        "  --ai-fps <n>       Inference rate (default 5). Ignored when the source\n"
-        "                      framerate is below --ai-full-rate-below\n"
+        "  --ai-fps <n>       Inference rate (default 8, range 5-12). Clamped to\n"
+        "                      [5,12]. Ignored when the source framerate is below\n"
+        "                      --ai-full-rate-below\n"
         "  --ai-confidence <f> Detection / tracker score gate (default 0.5)\n"
         "  --ai-model <path>  ONNX model (default models/yolo11n.onnx). Detection\n"
         "                      and pose models are auto-detected; e.g.\n"
@@ -214,7 +215,7 @@ int main(int argc, char** argv) {
     if (cli.source)  cfg.source          = cli.source_v;
     if (cli.ai)      cfg.ai.enable       = true;
     if (cli.ai_no)   cfg.ai.enable       = false;
-    if (cli.ai_fps)  cfg.ai.fps          = cli.ai_fps_v;
+    if (cli.ai_fps)  cfg.ai.fps          = ca::clamp_ai_fps(cli.ai_fps_v);
     if (cli.ai_conf) cfg.ai.confidence   = cli.ai_conf_v;
     if (cli.ai_model)  cfg.ai.model         = cli.ai_model_v;
     if (cli.ai_w)      cfg.ai.input_width   = cli.ai_w_v;

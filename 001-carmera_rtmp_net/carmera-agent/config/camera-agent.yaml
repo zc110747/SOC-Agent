@@ -28,7 +28,7 @@ log_level: info
 # and only AI results are missing.
 ai:
   enable: false                 # true: run person detection + tracking
-  fps: 5                        # inference rate (ignored when source fps < full_rate_below_fps)
+  fps: 8                        # inference rate, configurable range 5-12 (ignored when source fps < full_rate_below_fps)
   confidence: 0.5               # detection + tracker gate
   # YOLO11 detection (default) or pose model - both are auto-detected:
   #   models/yolo11n.onnx       person detection (COCO, class 0 = person)
