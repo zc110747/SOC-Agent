@@ -341,6 +341,29 @@ GOP=4s，服务端就出 4 秒的分段，frontier gap 会按 4 秒一级放大�
 
 > 安全提示：MediaMTX 的**控制 API**（默认 `api_bind: 127.0.0.1:9997`）只对内监听 —— 它没有任何鉴权，暴露到局域网等于把每一路流的控制权交出去。媒体端口（RTSP/WebRTC/HLS）同理无鉴权，只在可信网络内开放。
 
+### 6.4 实时播放稳定性加固（2026-09-03）
+
+实时播放链路（WebRTC 播放器 + 服务端信令/HLS 代理）做了两处稳定性加固，均已有单元测试覆盖。
+
+**(a) WebRTC 播放器 `clearWatchdog` 缺失 → 连接 established 时崩溃与重启循环**
+
+`web/src/webrtc/player.ts` 的 `onconnectionstatechange` 在 `connectionState === 'connected'` 时调用
+`this.clearWatchdog()`，但类内从未定义该方法，抛 `Uncaught TypeError` → 后续 `emit('connected')` 不执行、
+状态机卡在 `connecting`；7s 看门狗定时器未被清除，超时触发 `onWebRTCFailure()` → 重连 → 无限循环（即
+"显示过程中会重启"）。已补一个只清 watchdog 的 `clearWatchdog()` 方法，与调用点同名。提交 `05db7de`。
+
+**(b) 重启瞬间一次性 `502`（MediaMTX 端点启动竞态）**
+
+服务端 `Manager.Start()` 只等 MediaMTX **控制 API** 就绪（`waitReady` 12s），但 WebRTC 的 WHEP 端点
+（`:8889/<path>/whep`）常在控制 API 就绪后**再晚几百 ms 才监听**。刚重启后浏览器首个 offer 命中未监听端口 →
+连接拒绝 → `WebRTCOffer` 回 **502**；客户端 `player.ts` 重连自愈，故"一次 502 后正常"。
+
+修复：`WebRTCOffer`（`internal/mediamtx/manager.go`）与 `hlsProxy`（`internal/api/hls.go`）对 **transport 层
+错误（连接拒绝 / 上游未监听）** 做 **4 次 / 250ms 退避重试**，吸收启动竞态；逻辑错误（4xx/5xx）仍立即返回、
+不重试。提交 `bd73519` / `e9df885`。回归测试 `manager_test.go` / `hls_test.go`（`api` + `mediamtx` 包，4 用例 PASS）。
+
+> 验证：`go vet ./...` 0 警告；`go test ./...` 全绿；`internal/api` + `internal/mediamtx` 4 用例 PASS。
+
 ---
 
 ## 7. 联合运行（video-server + carmera-agent）
@@ -678,6 +701,8 @@ curl -s http://127.0.0.1:8081/api/metadata | python -m json.tool
 | **Metadata**：`GET /api/cameras/{id}/metadata` 返回空 | 落库用的 camera_id 与查询用的不一致。`resolveCamera` 会先把 id 规范化（`Get` → `GetByStreamPath`）再回写，但未知 id 在 permissive 模式下原样存储。查 `GET /api/metadata` 看实际存的 `camera_id` |
 | **Metadata**：单包返回 413 | 超出 `metadata.max_body_bytes`（默认 1 MiB）。调大该值，或让 agent 降低单帧目标数 |
 | **Metadata**：`media_server: error` 且没有任何摄像头 | MediaMTX 子进程因 UDP 端口冲突退出（默认 RTP/RTCP 8000/8001 是全局共享的）。给 `mediamtx.rtp_port` / `rtcp_port` 显式配值，并 `taskkill` 残留 mediamtx |
+| 浏览器控制台 `Uncaught TypeError: this.clearWatchdog is not a function` | `player.ts` 缺方法 → 见 6.4(a)，已修复 `05db7de`；**重启 video-server 加载新二进制**后消失 |
+| 重启服务后首帧前偶发一次 `502 (Bad Gateway)` | MediaMTX WHEP 端点启动竞态 → 见 6.4(b)，已加 4 次/250ms 退避重试；若**频繁**出现说明上游持续不可达（查 MediaMTX 是否真起来、`/api/health` 的 `media_server` 字段） |
 
 ---
 
