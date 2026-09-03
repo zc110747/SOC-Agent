@@ -23,9 +23,9 @@ import (
 
 // Path mirrors the relevant fields of a MediaMTX v3 API path object.
 type Path struct {
-	Name      string `json:"name"`
-	Online    bool   `json:"online"`
-	Source    *struct {
+	Name   string `json:"name"`
+	Online bool   `json:"online"`
+	Source *struct {
 		Type string `json:"type"`
 		ID   string `json:"id"`
 	} `json:"source"`
@@ -51,12 +51,12 @@ type PathsListResponse struct {
 
 // Manager controls the MediaMTX lifecycle.
 type Manager struct {
-	cfg            *config.Config
-	cmd            *exec.Cmd
-	generatedPath  string
-	apiBase        string
-	webrtcBase     string
-	httpClient     *http.Client
+	cfg           *config.Config
+	cmd           *exec.Cmd
+	generatedPath string
+	apiBase       string
+	webrtcBase    string
+	httpClient    *http.Client
 }
 
 func New(cfg *config.Config) *Manager {
