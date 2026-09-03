@@ -59,3 +59,10 @@ Windows PC 摄像头 → GStreamer → H.264 → RTSP 推流，模拟未来 RK35
 - **坑**：`start "... " cmd /c "prog > log 2>&1"` 内嵌引号会让 cmd 重定向解析失败（日志文件不生成）。
   项目路径无空格 → cmd /c 内不加内层引号即可。
 - `.gitignore` 已补：*.err *.log *.h264 capture-* auto.crt auto.key。
+
+## Skills 沉淀位置（跨会话约定）
+- 端侧 AI 零依赖配方（Phase 1 YOLO+ByteTrack + Phase 2 Metadata 上报）沉淀在 **`soc-edge-ai-zerodep`**，**双份存储**：
+  用户级 `~/.workbuddy/skills/soc-edge-ai-zerodep/SKILL.md` 与
+  项目级 `D:\user_project\git\SOC-Agent\.workbuddy\skills\soc-edge-ai-zerodep/SKILL.md`。
+  **改一处必须两边同步**（2026-09-03 同步过一次）。
+- 项目级 skills 目录另有 `soc-camera-rtsp-agent`、`soc-windows-gstreamer-build`（主架构 / MSVC 构建）。

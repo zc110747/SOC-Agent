@@ -450,7 +450,7 @@ curl http://127.0.0.1:8000/            # 查看累计条数 / uptime
 | 断服期间队列涨到几百条 | 早期实现在离线时仍入队 | 退避窗内直接 `++dropped_` 丢弃（过时 metadata 无价值），队列恒 ≤ `queue_size` |
 | `std::clamp` 在 bbox 裁剪上出现 UB | `lo > hi` 时 `std::clamp` 行为未定义（如 `w<=0`） | 自写 `clampi()` 先规整 `hi<lo`，并保证 `x2 ∈ [x1+1, w]` |
 | `RecordingTransport` 编译报 C2365 | 测试替身的成员名 `connected` 与成员函数 `connected()` 冲突 | 成员改名 `up` |
-| mock server 在 agent 退出时打 `ConnectionResetError` 栈 | agent 直接关闭 keep-alive 套接字 | `do_POST` 吞掉 `ConnectionResetError/BrokenPipeError/OSError` |
+| mock server 在 agent 退出时打 `ConnectionResetError` 栈 | agent 直接关闭 keep-alive 套接字，异常发生在 `socketserver.finish_request` 阶段（`BaseHTTPRequestHandler.__init__` 读下一请求行时），早于 `do_POST`，`do_POST` 内的 try/except 包不到 | 在 **`Server` 类（不是 `Handler`）** 覆盖 `handle_error()`：异常是 `ConnectionResetError/BrokenPipeError/OSError` 子类时静默 `return`；已真机验证（agent 退出后 mock 日志 traceback=0） |
 | Git Bash 里 `taskkill //PID N //F` 无效（路径转换吃参数），导致"断服窗口"根本没建起来 | MSYS 路径转换 | 改用 `TaskStop` 关后台任务，或在 bash 里 `kill $PID`（进程由 bash 启动） |
 
 ---
@@ -701,8 +701,8 @@ std::unique_ptr<IMetadataTransport> create_metadata_transport(const MetadataConf
 | 2 | **服务端停止**（kill mock，95s 长跑） | 整个断服期间视频 `STREAMING` 且 `dropped=0`，AI 稳定 `fps≈5.0`；`send failed` + `reconnecting in Nms(1s→2s→4s→…)` 按退避出现；`queue` 恒 ≤8，`dropped` 单调增；agent 未退出 |
 | 3 | **端口不可达**（`http://127.0.0.1:1`） | 同 2；单测断言 30 次 push <100ms（证明 AI 线程不做网络工作）、`queue_size ≤ 3` |
 | 4 | **服务端恢复** | `sent` 自动恢复增长（110→286）、`failed/dropped` 冻结；`reconnect` 计数 +1 并出 `connection restored`（此前因 WinHTTP 惰性连接漏计，已修并由单测 `metadata_reconnect_counted_on_recovery` 锁定） |
-| 5 | **AI 异常** | 模型加载失败 → AI 不产出结果，视频与 agent 正常；metadata 只剩心跳（待补真机复测记录） |
-| 6 | **AI 关闭** | `--no-ai --metadata`：视频正常，metadata 仅发心跳（待补真机复测记录） |
+| 5 | **AI 异常** | 模型路径故意填错 `models/does-not-exist.onnx` + `--ai --metadata`（`--source videotestsrc`） | 日志 `[AI] model file not found` → `[AI] model init failed (...), video stream continues without AI` → `[warning] [AI] not started; video stream is unaffected`；视频全程 `STREAMING`（frames=424 `dropped=0` bitrate≈4070kbps），AI 不产出结果 → metadata 只剩心跳（`sent=3`，无 `frame` 消息）；mock 收到 cam_t5 共 3 条；agent 正常退出（exit=0） |
+| 6 | **AI 关闭** | `--no-ai --metadata`（`--source videotestsrc`） | 视频正常 `STREAMING`（frames=426 `dropped=0` bitrate≈3897kbps）；管线不含 tee/aisplit（AI 分支完全不挂载）；metadata 仅发心跳（每 5s 一条，`sent=3`，mock 收到 cam_t6 共 3 条）；agent 正常退出（exit=0） |
 
 单元测试 **22/22 通过**（13 原有（含 3 个 AI）+ 9 个 Metadata）：
 
