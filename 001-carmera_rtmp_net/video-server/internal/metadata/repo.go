@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -83,6 +84,7 @@ func Migrate(db *sql.DB) error {
 			y1          INTEGER NOT NULL,
 			x2          INTEGER NOT NULL,
 			y2          INTEGER NOT NULL,
+			keypoints   TEXT,
 			received_at TEXT    NOT NULL
 		)`,
 		// Serves both the latest-frame lookup and the retention prune.
@@ -93,7 +95,29 @@ func Migrate(db *sql.DB) error {
 			return fmt.Errorf("migrate metadata: %w", err)
 		}
 	}
+	// Existing databases were created before the keypoints column existed.
+	// ADD COLUMN is a no-op on a fresh DB (the CREATE above already has it);
+	// on an old DB it backfills the nullable column without touching rows.
+	if err := addColumnIfMissing(db, "ai_object", "keypoints", "TEXT"); err != nil {
+		return fmt.Errorf("migrate ai_object.keypoints: %w", err)
+	}
 	return nil
+}
+
+// addColumnIfMissing issues ALTER TABLE ... ADD COLUMN only when the column is
+// absent, so Migrate is safe to re-run on databases of any age.
+func addColumnIfMissing(db *sql.DB, table, column, typ string) error {
+	rows, err := db.Query("SELECT 1 FROM pragma_table_info(?) WHERE name = ?", table, column)
+	if err != nil {
+		return err
+	}
+	exists := rows.Next()
+	rows.Close()
+	if exists {
+		return nil
+	}
+	_, err = db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + typ)
+	return err
 }
 
 const timeFmt = time.RFC3339Nano
@@ -124,15 +148,15 @@ func (r *Repository) SaveFrame(f *FrameMessage, received time.Time) error {
 	}
 
 	ins, err := tx.Prepare(`
-		INSERT INTO ai_object (camera_id,frame_id,class,confidence,track_id,x1,y1,x2,y2,received_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`)
+		INSERT INTO ai_object (camera_id,frame_id,class,confidence,track_id,x1,y1,x2,y2,keypoints,received_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return fmt.Errorf("prepare ai_object: %w", err)
 	}
 	defer ins.Close()
 	for _, o := range f.Objects {
 		if _, err := ins.Exec(f.CameraID, f.FrameID, o.Class, o.Confidence, o.TrackID,
-			o.BBox[0], o.BBox[1], o.BBox[2], o.BBox[3], recv); err != nil {
+			o.BBox[0], o.BBox[1], o.BBox[2], o.BBox[3], kpJSON(o), recv); err != nil {
 			return fmt.Errorf("insert ai_object: %w", err)
 		}
 	}
@@ -287,9 +311,23 @@ func (r *Repository) status(cameraID string) (*StatusView, error) {
 	return &s, nil
 }
 
+// kpJSON marshals an object's pose keypoints to JSON for storage, or nil when
+// the object has none (detection model) so the column stays NULL and the wire
+// format for non-pose frames is unchanged.
+func kpJSON(o Object) interface{} {
+	if len(o.Keypoints) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(o.Keypoints)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
 func (r *Repository) objects(cameraID string, frameID int64) ([]ObjectView, error) {
 	rows, err := r.db.Query(`
-		SELECT class,confidence,track_id,x1,y1,x2,y2
+		SELECT class,confidence,track_id,x1,y1,x2,y2,keypoints
 		FROM ai_object WHERE camera_id = ? AND frame_id = ? ORDER BY id ASC`,
 		cameraID, frameID)
 	if err != nil {
@@ -299,9 +337,16 @@ func (r *Repository) objects(cameraID string, frameID int64) ([]ObjectView, erro
 	out := []ObjectView{}
 	for rows.Next() {
 		var o ObjectView
+		var kp []byte
 		if err := rows.Scan(&o.Class, &o.Confidence, &o.TrackID,
-			&o.BBox[0], &o.BBox[1], &o.BBox[2], &o.BBox[3]); err != nil {
+			&o.BBox[0], &o.BBox[1], &o.BBox[2], &o.BBox[3], &kp); err != nil {
 			return nil, err
+		}
+		if len(kp) > 0 {
+			var ks []Keypoint
+			if err := json.Unmarshal(kp, &ks); err == nil {
+				o.Keypoints = ks
+			}
 		}
 		out = append(out, o)
 	}

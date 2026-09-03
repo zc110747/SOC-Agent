@@ -161,6 +161,12 @@ async function pollMetadata() {
       ctx.fillStyle = 'rgba(0, 0, 0, 0.45)'
       ctx.fillText(tid, rx + rw - ctx.measureText(tid).width - padX, ry + lh - 4)
     }
+
+    // Pose skeleton (drawn over the box). Keypoints are [x, y, conf] in the
+    // same original video pixels as the bbox, so the same scale applies.
+    if (o.keypoints && o.keypoints.length >= 2) {
+      drawSkeleton(ctx, o.keypoints, sx, sy)
+    }
   }
 
   aiOn.value = !!snap.status?.running
@@ -170,6 +176,43 @@ async function pollMetadata() {
 function clearOverlay(canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D) {
   if (canvas.width === 0 || canvas.height === 0) return
   ctx.clearRect(0, 0, canvas.width, canvas.height)
+}
+
+// COCO 17-keypoint skeleton (0-based indices). yolo11n-pose emits COCO
+// landmarks, so this is the topology used to connect them on the overlay.
+const SKELETON: [number, number][] = [
+  [15, 13], [13, 11], [16, 14], [14, 12], [11, 12],
+  [5, 11], [6, 12], [5, 6], [5, 7], [6, 8],
+  [7, 9], [8, 10], [1, 2], [0, 1], [0, 2],
+  [1, 3], [2, 4], [3, 5], [4, 6]
+]
+const KP_MIN_CONF = 0.3
+
+function drawSkeleton(
+  ctx: CanvasRenderingContext2D,
+  kps: [number, number, number][],
+  sx: number,
+  sy: number
+) {
+  ctx.lineWidth = 2
+  ctx.strokeStyle = 'rgba(0, 220, 200, 0.85)'
+  for (const [a, b] of SKELETON) {
+    if (a >= kps.length || b >= kps.length) continue
+    const ka = kps[a]
+    const kb = kps[b]
+    if (ka[2] < KP_MIN_CONF || kb[2] < KP_MIN_CONF) continue
+    ctx.beginPath()
+    ctx.moveTo(ka[0] * sx, ka[1] * sy)
+    ctx.lineTo(kb[0] * sx, kb[1] * sy)
+    ctx.stroke()
+  }
+  ctx.fillStyle = 'rgba(0, 220, 200, 0.95)'
+  for (const k of kps) {
+    if (k[2] < KP_MIN_CONF) continue
+    ctx.beginPath()
+    ctx.arc(k[0] * sx, k[1] * sy, 2.5, 0, Math.PI * 2)
+    ctx.fill()
+  }
 }
 
 onMounted(() => {

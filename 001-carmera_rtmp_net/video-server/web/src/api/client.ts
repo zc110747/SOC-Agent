@@ -50,6 +50,9 @@ export interface MetadataObject {
   track_id: number
   /** [x1, y1, x2, y2] in ORIGINAL video pixels. */
   bbox: [number, number, number, number]
+  /** Pose landmarks [x, y, conf] in ORIGINAL video pixels. Present only for
+   *  pose models; detection-only output omits it. */
+  keypoints?: [number, number, number][]
 }
 
 export interface MetadataFrame {
