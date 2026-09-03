@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "camera_agent/ai/keypoint.h"
+
 namespace ca {
 
 // One detected + tracked object.
@@ -25,6 +27,10 @@ struct AIObject {
 
     // bbox in original video pixel coordinates, (x1,y1) = top-left.
     float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f;
+
+    // Body keypoints in original video pixels (pose model only; empty with a
+    // detection model). Serialized as the additive frame field "keypoints".
+    std::vector<Keypoint> keypoints;
 };
 
 // Standardized per-frame AI result. This is what Phase 2 will upload.
@@ -54,7 +60,7 @@ struct AIConfig {
     bool        enable      = false;
     int         fps         = 5;      // target inference rate
     float       confidence  = 0.5f;   // detector + tracker gate
-    std::string model       = "models/yolov8n.onnx";
+    std::string model       = "models/yolo11n.onnx";
     int         input_width  = 640;
     int         input_height = 640;
     int         queue_size   = 2;     // bounded; oldest frame is dropped on overflow

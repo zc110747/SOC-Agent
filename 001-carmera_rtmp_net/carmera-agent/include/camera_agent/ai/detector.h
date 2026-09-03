@@ -12,18 +12,23 @@
 #include <string>
 #include <vector>
 
+#include "camera_agent/ai/keypoint.h"
+
 namespace ca {
 
 // One raw detection, bbox already mapped back to original video coordinates.
+// With a pose model the keypoints vector carries the body joints (same pixel
+// space); with a detection model it stays empty.
 struct Detection {
     float       x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f;
     float       confidence = 0.0f;
     int         class_id   = 0;
     std::string class_name = "person";
+    std::vector<Keypoint> keypoints;   // empty = detection model
 };
 
 struct DetectorConfig {
-    std::string model_path    = "models/yolov8n.onnx";
+    std::string model_path    = "models/yolo11n.onnx";
     int         input_width   = 640;
     int         input_height  = 640;
     // Detections below this score are handed to the tracker only as "low score"
@@ -52,6 +57,10 @@ public:
 
     // Human readable backend, used in the "[AI] model loaded" log line.
     virtual const char* backend_name() const = 0;
+
+    // 0 = detection model; >0 = pose model with this many keypoints per
+    // object (17 for the COCO YOLO11n-pose). Known right after init().
+    virtual int keypoint_count() const { return 0; }
 };
 
 // Factory: returns the ONNX Runtime implementation when the project was built

@@ -1,7 +1,7 @@
 // YOLO detector, zero external dependencies besides ONNX Runtime.
 //
-// Deliberately NO OpenCV: letterbox resize, NMS and the YOLOv8 output decode are
-// implemented here in ~150 lines. That keeps the binary small, avoids an
+// Deliberately NO OpenCV: letterbox resize, NMS and the YOLOv8/YOLO11 output
+// decode (detection and pose heads) are implemented here. That keeps the binary small, avoids an
 // OpenCV version lock-in, and - more importantly - lets the same code move to
 // RK3568 unchanged (cross-compiling OpenCV there is a much bigger job).
 //
@@ -10,12 +10,14 @@
 // and the video stream keeps running (spec 19).
 
 #include "camera_agent/ai/detector.h"
+#include "camera_agent/ai/yolo_decode.h"
 #include "camera_agent/logger.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -152,6 +154,84 @@ void nms(std::vector<Detection>& dets, float thr) {
 
 } // namespace
 
+// ---- shared, testable decode (declared in yolo_decode.h) -------------------
+
+int keypoint_count_from_channels(int64_t channels) {
+    const int64_t min_pose_channels = 5 + 3 * 4;   // 4 box/cls + >=4 kpts
+    if (channels < min_pose_channels) return 0;
+    const int64_t rest = channels - 5;
+    if (rest % 3 != 0) return 0;
+    return static_cast<int>(rest / 3);
+}
+
+void decode_yolo_output(const float* data, int64_t rows, int64_t cols,
+                        bool channel_major, int want_class, float floor_score,
+                        int ow, int oh, float scale, int pad_x, int pad_y,
+                        std::vector<Detection>& out) {
+    out.clear();
+
+    const int64_t channels = channel_major ? rows : cols;
+    const int64_t anchors  = channel_major ? cols : rows;
+    if (channels <= 4 || anchors <= 0) {
+        CA_LOG_ERROR("[AI] unexpected model output shape {}x{}", rows, cols);
+        return;
+    }
+
+    const int kpts = keypoint_count_from_channels(channels);
+    const int64_t num_classes =
+        channels - 4 - static_cast<int64_t>(kpts) * 3;
+    if (want_class < 0 || want_class >= num_classes) {
+        CA_LOG_ERROR("[AI] model has {} classes; class id {} is out of range",
+                     num_classes, want_class);
+        return;
+    }
+
+    auto at = [&](int64_t a, int64_t c) -> float {
+        return channel_major ? data[c * anchors + a] : data[a * channels + c];
+    };
+
+    const float max_x = static_cast<float>(ow - 1);
+    const float max_y = static_cast<float>(oh - 1);
+
+    for (int64_t a = 0; a < anchors; ++a) {
+        const float score = at(a, 4 + want_class);
+        if (score < floor_score) continue;
+
+        const float cx = at(a, 0);
+        const float cy = at(a, 1);
+        const float bw = at(a, 2);
+        const float bh = at(a, 3);
+
+        Detection d;
+        // Undo the letterbox: subtract padding, then divide by the scale.
+        d.x1 = clampf((cx - bw * 0.5f - static_cast<float>(pad_x)) / scale, 0.0f, max_x);
+        d.y1 = clampf((cy - bh * 0.5f - static_cast<float>(pad_y)) / scale, 0.0f, max_y);
+        d.x2 = clampf((cx + bw * 0.5f - static_cast<float>(pad_x)) / scale, 0.0f, max_x);
+        d.y2 = clampf((cy + bh * 0.5f - static_cast<float>(pad_y)) / scale, 0.0f, max_y);
+        if (d.x2 <= d.x1 || d.y2 <= d.y1) continue;
+
+        d.confidence = score;
+        d.class_id   = want_class;
+        d.class_name = "person";
+
+        if (kpts > 0) {
+            d.keypoints.resize(static_cast<size_t>(kpts));
+            for (int j = 0; j < kpts; ++j) {
+                const int64_t base = 5 + static_cast<int64_t>(j) * 3;
+                Keypoint& k = d.keypoints[static_cast<size_t>(j)];
+                k.x = clampf((at(a, base + 0) - static_cast<float>(pad_x)) / scale,
+                             0.0f, max_x);
+                k.y = clampf((at(a, base + 1) - static_cast<float>(pad_y)) / scale,
+                             0.0f, max_y);
+                // The pose head already applies the sigmoid inside the exported
+                // graph. Clamp numeric drift only - NEVER sigmoid again here.
+                k.conf = clampf(at(a, base + 2), 0.0f, 1.0f);
+            }
+        }
+        out.push_back(std::move(d));
+    }
+}
+
 #ifdef CAMERA_AGENT_HAVE_ORT
 
 class OnnxYoloDetector : public IDetector {
@@ -160,11 +240,9 @@ public:
     bool detect(const uint8_t* rgb, int w, int h,
                 std::vector<Detection>& out) override;
     const char* backend_name() const override { return "onnxruntime"; }
+    int keypoint_count() const override { return kpt_count_; }
 
 private:
-    void decode(Ort::Value& v, int ow, int oh, float scale, int pad_x,
-                int pad_y, std::vector<Detection>& out);
-
     DetectorConfig        cfg_{};
     std::vector<uint8_t>  model_bytes_;   // must outlive the session
     std::unique_ptr<Ort::Env>     env_;
@@ -173,7 +251,49 @@ private:
     std::vector<float>    input_;    // NCHW normalized
     std::vector<uint8_t>  canvas_;   // letterboxed RGB
     bool                  have_io_names_ = false;
+    // 0 = detection model; >0 = pose head with this many keypoints (COCO: 17).
+    int                   kpt_count_ = 0;
+
+    // Query the model's own opinion about its mode. Preference: the embedded
+    // `kpt_shape` metadata (Ultralytics exports "[17, 3]" on pose models),
+    // then the output tensor shape (C = 5 + 3*K).
+    void probe_mode();
 };
+
+void OnnxYoloDetector::probe_mode() {
+    int kpt = 0;
+    try {
+        Ort::AllocatorWithDefaultOptions alloc;
+        auto kpt_shape = session_->GetModelMetadata()
+                             .LookupCustomMetadataMapAllocated("kpt_shape", alloc);
+        if (kpt_shape) {
+            const char* s = kpt_shape.get();
+            while (*s && (*s < '0' || *s > '9')) ++s;
+            if (*s) kpt = std::atoi(s);   // "[17, 3]" -> 17
+        }
+    } catch (const std::exception&) {
+        kpt = 0;
+    }
+    if (kpt <= 0) {
+        try {
+            const std::vector<int64_t> shape =
+                session_->GetOutputTypeInfo(0)
+                    .GetTensorTypeAndShapeInfo()
+                    .GetShape();
+            if (shape.size() == 3) {
+                const int64_t c = shape[1] < shape[2] ? shape[1] : shape[2];
+                kpt = keypoint_count_from_channels(c);
+            }
+        } catch (const std::exception&) {
+            kpt = 0;
+        }
+    }
+    kpt_count_ = kpt > 0 ? kpt : 0;
+    if (kpt_count_ > 0) {
+        CA_LOG_INFO("[AI] pose model detected: {} keypoints per object",
+                    kpt_count_);
+    }
+}
 
 bool OnnxYoloDetector::init(const DetectorConfig& cfg) {
     cfg_ = cfg;
@@ -229,6 +349,8 @@ bool OnnxYoloDetector::init(const DetectorConfig& cfg) {
     input_.resize(static_cast<size_t>(3) *
                   static_cast<size_t>(cfg.input_width) *
                   static_cast<size_t>(cfg.input_height));
+
+    probe_mode();
     return true;
 }
 
@@ -269,79 +391,26 @@ bool OnnxYoloDetector::detect(const uint8_t* rgb, int w, int h,
             Ort::RunOptions{nullptr}, in_names, inputs.data(), 1, out_names, 1);
         if (outs.empty()) return false;
 
-        decode(outs[0], w, h, scale, pad_x, pad_y, out);
+        Ort::TensorTypeAndShapeInfo tinfo = outs[0].GetTensorTypeAndShapeInfo();
+        const std::vector<int64_t> oshape = tinfo.GetShape();
+        if (oshape.size() != 3 || oshape[0] != 1) {
+            CA_LOG_ERROR("[AI] unexpected model output rank ({})", oshape.size());
+            out.clear();
+            return false;
+        }
+        // {1, C, N} with C < N is channel-major (YOLOv8/11 default export);
+        // otherwise assume anchor-major. Both are handled by the shared decode.
+        const bool channel_major = (oshape[1] < oshape[2]);
+        decode_yolo_output(outs[0].GetTensorMutableData<float>(),
+                           oshape[1], oshape[2], channel_major,
+                           cfg_.class_id, cfg_.low_confidence,
+                           w, h, scale, pad_x, pad_y, out);
         nms(out, cfg_.nms_threshold);
         return true;
     } catch (const std::exception& e) {
         CA_LOG_ERROR("[AI] inference failed: {}", e.what());
         out.clear();
         return false;
-    }
-}
-
-// Decode a YOLOv8/YOLO11 detection head.
-//
-// Two layouts occur in the wild and are auto-detected:
-//   {1, C, N}  (channel-major, YOLOv8/11 default export)  -> data[c*N + a]
-//   {1, N, C}  (anchor-major)                             -> data[a*C + c]
-// with C = 4 box coords + num_classes scores, N = number of anchors.
-void OnnxYoloDetector::decode(Ort::Value& v, int ow, int oh, float scale,
-                              int pad_x, int pad_y,
-                              std::vector<Detection>& out) {
-    Ort::TensorTypeAndShapeInfo info = v.GetTensorTypeAndShapeInfo();
-    const std::vector<int64_t> shape = info.GetShape();
-    if (shape.size() != 3 || shape[0] != 1) {
-        CA_LOG_ERROR("[AI] unexpected model output rank ({})", shape.size());
-        return;
-    }
-
-    const int64_t d1 = shape[1];
-    const int64_t d2 = shape[2];
-    const bool transposed = (d1 < d2);
-    const int64_t num_channels = transposed ? d1 : d2;
-    const int64_t num_anchors  = transposed ? d2 : d1;
-    if (num_channels <= 4 || num_anchors <= 0) {
-        CA_LOG_ERROR("[AI] unexpected model output shape {}x{}", d1, d2);
-        return;
-    }
-    const int64_t num_classes = num_channels - 4;
-    const int64_t want = cfg_.class_id;
-    if (want >= num_classes) {
-        CA_LOG_ERROR("[AI] model has {} classes; class id {} is out of range",
-                     num_classes, want);
-        return;
-    }
-
-    const float* data = v.GetTensorMutableData<float>();
-    auto at = [&](int64_t a, int64_t c) -> float {
-        return transposed ? data[c * num_anchors + a] : data[a * num_channels + c];
-    };
-
-    const float floor_score = cfg_.low_confidence;
-    const float max_x = static_cast<float>(ow - 1);
-    const float max_y = static_cast<float>(oh - 1);
-
-    for (int64_t a = 0; a < num_anchors; ++a) {
-        const float score = at(a, 4 + want);
-        if (score < floor_score) continue;
-
-        const float cx = at(a, 0);
-        const float cy = at(a, 1);
-        const float bw = at(a, 2);
-        const float bh = at(a, 3);
-
-        Detection d;
-        // Undo the letterbox: subtract padding, then divide by the scale.
-        d.x1 = clampf((cx - bw * 0.5f - static_cast<float>(pad_x)) / scale, 0.0f, max_x);
-        d.y1 = clampf((cy - bh * 0.5f - static_cast<float>(pad_y)) / scale, 0.0f, max_y);
-        d.x2 = clampf((cx + bw * 0.5f - static_cast<float>(pad_x)) / scale, 0.0f, max_x);
-        d.y2 = clampf((cy + bh * 0.5f - static_cast<float>(pad_y)) / scale, 0.0f, max_y);
-        if (d.x2 <= d.x1 || d.y2 <= d.y1) continue;
-
-        d.confidence = score;
-        d.class_id   = cfg_.class_id;
-        d.class_name = "person";
-        out.push_back(d);
     }
 }
 

@@ -71,6 +71,32 @@ std::string bbox_json(const AIObject& o, int w, int h) {
     return os.str();
 }
 
+// Additive, backward-compatible pose extension: "keypoints":[[x,y,conf],...].
+// Coordinates are original-video pixels (floats, 2 decimals), clamped into the
+// frame; conf is emitted as-is in [0,1] (already sigmoided by the model).
+// Present only when the object carries keypoints (pose model), so detection
+// model output is byte-identical to previous versions.
+std::string keypoints_json(const AIObject& o, int w, int h) {
+    if (o.keypoints.empty()) return {};
+    if (w <= 0 || h <= 0) w = h = 0;
+
+    std::ostringstream os;
+    os << ",\"keypoints\":[";
+    for (size_t j = 0; j < o.keypoints.size(); ++j) {
+        const Keypoint& k = o.keypoints[j];
+        if (j) os << ',';
+        const int x = clampi(static_cast<int>(std::lround(k.x)), 0,
+                             w > 0 ? w : 0);
+        const int y = clampi(static_cast<int>(std::lround(k.y)), 0,
+                             h > 0 ? h : 0);
+        os << '[' << fixed2(x) << ',' << fixed2(y) << ','
+           << fixed2(k.conf < 0.0f ? 0.0f : (k.conf > 1.0f ? 1.0f : k.conf))
+           << ']';
+    }
+    os << ']';
+    return os.str();
+}
+
 uint64_t epoch_ms() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -101,6 +127,7 @@ std::string encode_frame_metadata(const AIFrameResult& r, const MetadataConfig& 
         s += ",\"confidence\":" + fixed2(o.confidence);
         s += ",\"track_id\":" + std::to_string(o.track_id);
         s += ",\"bbox\":" + bbox_json(o, r.video_width, r.video_height);
+        s += keypoints_json(o, r.video_width, r.video_height);
         s += '}';
     }
     s += "]}";
@@ -122,6 +149,9 @@ std::string encode_status_metadata(const AIStatusInfo& st, const MetadataConfig&
     s += ",\"last_frame_id\":" + std::to_string(st.last_frame_id);
     s += ",\"last_timestamp\":" + std::to_string(st.last_timestamp);
     s += ",\"processed\":" + std::to_string(st.processed);
+    if (st.keypoint_count > 0) {
+        s += ",\"keypoints\":" + std::to_string(st.keypoint_count);
+    }
     s += "}";
     s += ",\"wall_clock\":" + std::to_string(epoch_ms());
     s += "}";

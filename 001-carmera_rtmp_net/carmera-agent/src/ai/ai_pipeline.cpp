@@ -115,9 +115,13 @@ bool AIPipeline::init(const AIConfig& cfg, int video_width, int video_height,
     }
     tracker_->configure(tcfg);
 
-    CA_LOG_INFO("[AI] ready: backend={} model={} input={}x{} conf={:.2f}",
+    const std::string mode =
+        detector_->keypoint_count() > 0
+            ? "pose(" + std::to_string(detector_->keypoint_count()) + "kpt)"
+            : "detect";
+    CA_LOG_INFO("[AI] ready: backend={} model={} input={}x{} conf={:.2f} mode={}",
                 detector_->backend_name(), cfg.model, cfg.input_width,
-                cfg.input_height, cfg.confidence);
+                cfg.input_height, cfg.confidence, mode);
     CA_LOG_INFO("[AI] source {}x{}@{}fps -> {} (queue={}, interval={}ms)",
                 video_width, video_height, video_fps,
                 full_rate ? "full-rate" : "sub-sampled", cfg.queue_size,
@@ -282,6 +286,7 @@ void AIPipeline::process(AIFrame& f) {
         o.y1         = t.y1;
         o.x2         = t.x2;
         o.y2         = t.y2;
+        o.keypoints  = t.keypoints;
         res.objects.push_back(std::move(o));
     }
 

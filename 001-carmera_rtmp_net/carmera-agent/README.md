@@ -87,7 +87,7 @@ camera-agent/
 - **ffmpeg/ffplay**（仅验证/观看用）：加入 `PATH`。
 - 依赖仅 `spdlog`（CMake `FetchContent` 自动拉取），无其他第三方依赖。
 - **可选**——**ONNX Runtime 1.x（Windows x64 CPU）**：AI 分支加载 `.onnx` 模型用。未安装时 AI 自动停用，编出 `NullDetector`，视频链路不受影响。`include\` + `lib\` 即可；运行时 DLL 由 CMake `POST_BUILD` 自动拷到 exe 旁。CMake 按 `-DONNXRUNTIME_ROOT` → `$ENV{ONNXRUNTIME_ROOT}` → `D:/Software/onnxruntime` → `C:/onnxruntime` → 其他通用前缀顺序定位。
-- **可选**——YOLO 模型（`yolov8n.onnx`，约 12.3 MB）：放在项目根 `models/` 下；路径可在 `ai.model` 配置或 `--ai-model` 覆盖。
+- **可选**——YOLO11 模型（Ultralytics 官方 ONNX，下载地址与 SHA-256 见 `third_lib.md`）：`yolo11n.onnx`（检测，默认）与 `yolo11n-pose.onnx`（17 关键点姿态），放在项目根 `models/` 下；路径可在 `ai.model` 配置或 `--ai-model` 覆盖，检测/姿态模型自动识别。
 
 > 外部工具一律按**裸名称**调用，因此必须在本机 `PATH` 上。双击 `.bat` 时继承的是注册表里的系统/用户 PATH，**不是**已开终端的 PATH —— 改完 PATH 要重开终端才生效。
 
@@ -167,7 +167,7 @@ ai:
   enable: false                # 启用人检测 + ByteTrack 跟踪
   fps: 5                       # 推理率（源 fps < full_rate_below_fps 时改为每帧都算）
   confidence: 0.5              # 检测+跟踪门限
-  model: models/yolov8n.onnx   # ONNX 模型路径（相对工作目录）
+  model: models/yolo11n.onnx   # ONNX 模型路径（相对工作目录）；yolo11n-pose.onnx 为姿态模式
   input_width: 640
   input_height: 640
   queue_size: 2                # 有界队列；满了丢最老帧保最新
@@ -233,7 +233,7 @@ MediaMTX 从项目根目录启动时会自动加载本文件。`all_others` + �
 | `--ai` / `--no-ai` | `--no-ai` | 启/停 AI 分支（人检测 + 跟踪） |
 | `--ai-fps <n>` | 5 | AI 推理率（`source fps < full_rate_below_fps` 时改为每帧） |
 | `--ai-confidence <f>` | 0.5 | 检测+跟踪置信度门限 |
-| `--ai-model <path>` | `models/yolov8n.onnx` | ONNX 模型路径 |
+| `--ai-model <path>` | `models/yolo11n.onnx` | ONNX 模型路径（检测/姿态自动识别） |
 | `--ai-input <w> <h>` | 640 640 | 网络输入尺寸 |
 | `--ai-queue <n>` | 2 | 有界队列深度 |
 | `--ai-full-rate-below <n>` | 10 | 源 fps 低于此值时改为每帧都跑 |
@@ -308,7 +308,7 @@ ctest --test-dir build-msvc --output-on-failure
 ctest --test-dir build --output-on-failure
 ```
 
-覆盖：摄像头枚举、管线创建、H264 编码、RTSP 连接、RTSP 断开、自动重连（退避 `1/2/5/10s` 封顶验证）、参数错误、正常退出、AI 端到端（detector 真图检出 + ByteTrack 稳定 ID + AIPipeline 生命周期）、Metadata 端到端（JSON 字段与 bbox 裁剪、空结果、心跳、有界队列、断服不阻塞、恢复后重连计数、配置解析）。**22/22 通过**。
+覆盖：摄像头枚举、管线创建、H264 编码、RTSP 连接、RTSP 断开、自动重连（退避 `1/2/5/10s` 封顶验证）、参数错误、正常退出、AI 端到端（detector 真图检出 + ByteTrack 稳定 ID + AIPipeline 生命周期）、YOLO11 解码（通道数判型、双布局合成张量、pose 17 关键点逆变换/conf 不二次 sigmoid）、pose 真模型回归（yolo11n-pose bus.jpg 4 人 17 关键点全落帧内）、Metadata 端到端（JSON 字段与 bbox 裁剪、空结果、心跳、有界队列、断服不阻塞、恢复后重连计数、配置解析）。**26/26 通过**。
 
 ### 2. 端到端验收（`scripts/e2e-test.ps1`，真实 GStreamer 后端）
 
@@ -565,7 +565,7 @@ Camera (mfvideosrc 1280x720@30)
 
 ### 已知边界
 
-- **CPU 推理**：i7-8700 / yolov8n @ 640x640 单次约 80~100 ms；1080p 输入（letterbox 后仍为 640x640）下推理时间一致，但 RGB 拷贝到 AI 线程的开销会随分辨率线性增加（720p 一帧 2.7 MB，30 fps 拷贝 ≈80 MB/s，可忽略）。
+- **CPU 推理**：i7-8700 @ 640x640 单次约 88 ms（yolo11n 检测）/ 112~150 ms（yolo11n-pose）；1080p 输入（letterbox 后仍为 640x640）下推理时间一致，但 RGB 拷贝到 AI 线程的开销会随分辨率线性增加（720p 一帧 2.7 MB，30 fps 拷贝 ≈80 MB/s，可忽略）。
 - **不接 GPU**：`onnxruntime` Windows CPU 即可。RK3568 阶段切 `rknn` 后端。
 - **tracker 只支持 class_id 0 (person)**：spec 11 要求不引入 ReID/face recog，因此多类别时多类各自独立跟踪，bbox 共享同一个 track 空间。
 
@@ -611,10 +611,16 @@ AI 线程                        MetadataManager（独立发送线程）
   "video_width": 1280,
   "video_height": 720,
   "objects": [
-    { "class": "person", "confidence": 0.93, "track_id": 17, "bbox": [812, 210, 1040, 850] }
+    { "class": "person", "confidence": 0.93, "track_id": 17, "bbox": [812, 210, 1040, 850] },
+    { "class": "person", "confidence": 0.88, "track_id": 18, "bbox": [100, 300, 420, 850],
+      "keypoints": [[512.3, 214.6, 0.97], [505.1, 208.2, 0.93], ["…共 17 项…"]] }
   ]
 }
 ```
+
+- `keypoints` 为**加法扩展、可选字段**：仅 pose 模型（如 `yolo11n-pose.onnx`）输出，检测模型的消息与旧版逐字节一致。
+- 语义：COCO 17 关键点顺序（0 鼻 … 16 右踝），`[x, y, conf]`，x/y 为**原始视频像素**（已裁剪入帧，2 位小数），conf ∈ [0,1]（模型内已 sigmoid，接收方**不得**再做 sigmoid）。
+- 心跳 `ai` 段带 `"keypoints": 17` 表示当前为姿态模式（检测模型无此字段）。
 
 心跳/状态消息（`heartbeat_interval_sec` 周期，默认 10s）：
 
@@ -626,7 +632,7 @@ AI 线程                        MetadataManager（独立发送线程）
   "wall_clock": 1756773215000,
   "ai": {
     "enable": true, "running": true, "fps": 5.00,
-    "model": "models/yolov8n.onnx", "tracker": "bytetrack",
+    "model": "models/yolo11n.onnx", "tracker": "bytetrack",
     "last_frame_id": 15230, "last_timestamp": 1756773210123, "processed": 99
   }
 }

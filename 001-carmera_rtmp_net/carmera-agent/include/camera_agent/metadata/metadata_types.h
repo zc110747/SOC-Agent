@@ -62,6 +62,9 @@ struct AIStatusInfo {
     uint64_t    last_frame_id  = 0;
     uint64_t    last_timestamp = 0;   // ms, video time base (from AIFrameResult)
     uint64_t    processed      = 0;
+    // 0 = detection model; >0 = pose model with this many keypoints per
+    // object (emitted in the heartbeat so receivers can adapt their UI).
+    int         keypoint_count = 0;
 };
 
 } // namespace ca

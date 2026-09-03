@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "camera_agent/ai/detector.h"
+#include "camera_agent/ai/keypoint.h"
 
 namespace ca {
 
@@ -21,6 +22,8 @@ struct TrackedObject {
     float       confidence = 0.0f;
     int         class_id   = 0;
     std::string class_name = "person";
+    // Pass-through of the matched detection's keypoints (pose model only).
+    std::vector<Keypoint> keypoints;
 };
 
 struct TrackerConfig {

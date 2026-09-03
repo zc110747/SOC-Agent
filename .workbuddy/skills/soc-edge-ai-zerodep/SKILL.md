@@ -340,3 +340,50 @@ std::unique_ptr<IMetadataTransport> create_metadata_transport(const MetadataConf
 - Windows 用 **WinHTTP**（系统组件，零额外依赖）；非 Windows 编译期落到 `NullMetadataTransport`。
 - 未来 Linux/RK3568 只新增一个 `http_transport_curl.cpp`，**上层与头文件完全不动**。
 - 提供 `set_transport()` 供单测注入替身，无需真服务端即可验证投递路径。
+
+## 十三、Phase 3：WSS/TLS 控制面（Schannel → OpenSSL 教训，2026-09-03）
+
+### 结论
+- Windows C++ 客户端连 Go `crypto/tls` 服务器，**不要用 Schannel**：TLS 1.2 首个 app-data 记录
+  explicit nonce 用 seqnum 1（应为 0，off-by-one），GCM/CBC 均被 `bad record mac` 拒收；握手本身
+  100% 成功（双方 Finished 校验通过）。本机 TLS 1.3 客户端默认禁用（`0x80090331`），启用需 admin。
+- **方案**：客户端 TLS 层换 OpenSSL（`TLS_client_method` + min TLS 1.2），WS 帧/握手/auth 逻辑
+  复用；Go server 不动；未来 RK3568/ESP32 用 mbedTLS（同一标准语义）。
+- Windows OpenSSL 便携包：FireDaemon ZIP（免安装/免 admin，含 MSVC include+lib），解压后用 x64 子树。
+
+### OpenSSL 接入要点（MSVC + Ninja）
+- CMake 候选路径探测（判据 `include/openssl/ssl.h`）→ `find_package(OpenSSL REQUIRED)` →
+  `OpenSSL::SSL OpenSSL::Crypto`；`libssl-3-x64.dll`/`libcrypto-3-x64.dll` 构建后拷 exe 旁。
+- 三档校验：insecure=`SSL_VERIFY_NONE`；ca_cert_path=`SSL_CTX_load_verify_locations`+主机名校验；
+  默认系统信任库。`SSL_MODE_AUTO_RETRY` 必开。
+- **IP 字面量主机名校验走 `X509_VERIFY_PARAM_set1_ip_asc`**（匹配证书 IP-SAN）；
+  `SSL_set1_host` 只有 DNS 语义，连 127.0.0.1 会校验失败。
+- SNI：`SSL_set_tlsext_host_name`；读写用 `SSL_write_ex/SSL_read_ex` 循环；错误统一
+  `ERR_get_error()` 排队打印（否则错误信息静默丢失）。
+
+### 通用坑（迁移后才暴露）
+- **WS 头名解析必须大小写无关**（RFC 7230）：gorilla 返回 canonical `Sec-WebSocket-Accept:`，
+  小写查找会假报 "missing Sec-WebSocket-Accept"。潜在 bug 可能在旧实现里从未被执行到——
+  换传输层时整条路径要重新走一遍端到端。
+- 验证 Go server：`config/config.yaml` 的 8080 常被别的应用占用，用 `config.joint.yaml`（8081）；
+  token 在 security.tokens 段（demo 值，非硬编码）。
+
+## 十四、YOLO11 检测/姿态双模型切换（2026-09-03）
+
+### 模型获取
+- Ultralytics assets 仓库 release 直接提供**官方 ONNX 成品**（无需 pip 导出）：
+  `https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.onnx`（检测，{1,84,8400}）
+  `https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-pose.onnx`（姿态，{1,56,8400}）
+- YOLO11 detect 输出与 YOLOv8 **完全同布局**，换模型路径即用，解码零改动。
+
+### pose 解码要点
+- **pose 判型**：优先读 ONNX 内嵌 metadata `kpt_shape`（`session_->GetModelMetadata().LookupCustomMetadataMapAllocated("kpt_shape", alloc)`，值如 "[17, 3]"）；fallback 形状启发式 `(C-5)%3==0 且 K>=4`（C=56→17）。注意：13/16/… 类检测模型会被启发式误判，metadata 优先。
+- 通道布局：`4 box + 1 cls + 3*K kpt`。**kpt conf 模型内已 sigmoid**（export 图内 `sigmoid`），解码只 clamp [0,1]，**绝不再 sigmoid**（与 cls 分数同一条铁律）。
+- kpt 坐标是输入图像素空间，逆变换与 bbox 相同：`(v - pad) / scale`，clamp 进原始帧。
+- 解码函数抽成**无 ORT 依赖的纯函数头文件**（如 `yolo_decode.h`，`decode_yolo_output(data, rows, cols, channel_major, ...)`），单测用合成张量（无需真模型即可测双布局 + 逆变换 + conf 透传）；真模型回归用 bus.jpg（yolo11n-pose 4 人 17kpt 全落帧内）。
+- 关键点经 tracker 透传：`Detection.keypoints -> DetBox/STrack.kpts -> TrackedObject.keypoints`（tracker 只吃 bbox，kpts 原样携带）。
+- 协议**加法扩展**：objects 加可选 `"keypoints":[[x,y,conf],…]`（x/y 原始像素、2 位小数、裁剪入帧），检测模型消息**逐字节不变**；心跳 ai 段加 `"keypoints":N`。
+- 实测性能 i7-8700 @ 640x640：yolo11n 检测 ≈88ms/帧，yolo11n-pose ≈112~150ms/帧，5fps 采样均够用。
+
+### 提醒
+- 同一文件多处修改**严禁并行 Edit**（一条消息多个 Edit 同文件会互相覆盖，且工具报成功）——逐个串行改，改完 grep 全量核对，再编译。

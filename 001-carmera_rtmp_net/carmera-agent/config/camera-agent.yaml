@@ -30,7 +30,10 @@ ai:
   enable: false                 # true: run person detection + tracking
   fps: 5                        # inference rate (ignored when source fps < full_rate_below_fps)
   confidence: 0.5               # detection + tracker gate
-  model: models/yolov8n.onnx    # relative paths are resolved from the working directory
+  # YOLO11 detection (default) or pose model - both are auto-detected:
+  #   models/yolo11n.onnx       person detection (COCO, class 0 = person)
+  #   models/yolo11n-pose.onnx  adds 17 body keypoints per person
+  model: models/yolo11n.onnx    # relative paths are resolved from the working directory
   input_width: 640
   input_height: 640
   queue_size: 2                 # bounded frame queue; oldest frame dropped on overflow

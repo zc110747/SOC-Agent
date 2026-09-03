@@ -268,6 +268,9 @@ struct STrack {
     bool        lost = false;
     int         class_id = 0;
     std::string class_name = "person";
+    // Latest matched detection's keypoints (pose model only; the tracker
+    // itself is bbox-only, these are carried through untouched).
+    std::vector<Keypoint> kpts;
 };
 
 struct DetBox {
@@ -275,6 +278,7 @@ struct DetBox {
     float       score = 0.0f;
     int         class_id = 0;
     std::string class_name = "person";
+    std::vector<Keypoint> kpts;
 };
 
 struct MatchResult {
@@ -372,6 +376,7 @@ void ByteTrackTracker::re_activate(STrack& t, const DetBox& d, int frame_id) {
     t.score       = d.score;
     t.class_id    = d.class_id;
     t.class_name  = d.class_name;
+    t.kpts        = d.kpts;
     t.frame_id    = frame_id;
     t.end_frame   = frame_id;
     t.activated   = true;
@@ -389,6 +394,7 @@ void ByteTrackTracker::refresh(STrack& t, const DetBox& d, int frame_id) {
     t.score      = d.score;
     t.class_id   = d.class_id;
     t.class_name = d.class_name;
+    t.kpts       = d.kpts;
     t.frame_id   = frame_id;
     t.end_frame  = frame_id;
     t.activated  = true;
@@ -408,6 +414,7 @@ std::vector<TrackedObject> ByteTrackTracker::update(
         b.score      = d.confidence;
         b.class_id   = d.class_id;
         b.class_name = d.class_name;
+        b.kpts       = d.keypoints;
         boxes.push_back(std::move(b));
     }
     // `boxes` is pre-reserved, so these pointers stay valid.
@@ -506,6 +513,7 @@ std::vector<TrackedObject> ByteTrackTracker::update(
         t.score      = d.score;
         t.class_id   = d.class_id;
         t.class_name = d.class_name;
+        t.kpts       = d.kpts;
         activate(t, frame_id_);
         activated_out.push_back(t);
     }
@@ -536,6 +544,7 @@ std::vector<TrackedObject> ByteTrackTracker::update(
         o.confidence = t.score;
         o.class_id   = t.class_id;
         o.class_name = t.class_name;
+        o.keypoints  = t.kpts;
         out.push_back(std::move(o));
     }
     return out;

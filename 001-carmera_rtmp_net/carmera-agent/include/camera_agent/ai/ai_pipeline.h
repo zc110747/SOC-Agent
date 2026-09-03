@@ -49,6 +49,12 @@ public:
 
     AIStats stats() const;
 
+    // 0 = detection model; >0 = pose model with this many keypoints per
+    // object. Valid after a successful init(), 0 otherwise.
+    int keypoint_count() const {
+        return detector_ ? detector_->keypoint_count() : 0;
+    }
+
 private:
     void thread_loop();
     void process(AIFrame& f);

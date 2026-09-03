@@ -126,6 +126,7 @@ void StreamController::start_metadata() {
         s.model     = cfg_.ai.model;
         s.last_frame_id  = last_ai_frame_id_.load();
         s.last_timestamp = last_ai_ts_.load();
+        s.keypoint_count = ai_.keypoint_count();
         if (ai_.is_running()) {
             const auto a = ai_.stats();
             s.fps       = a.ai_fps;
