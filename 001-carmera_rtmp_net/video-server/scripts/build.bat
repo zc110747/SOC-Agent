@@ -11,7 +11,7 @@ if %errorlevel% neq 0 (
     echo using bundled go: %GO_BIN%
   ) else (
     echo ERROR: go not found on PATH and .toolchain\go\go\bin\go.exe missing.
-    echo Install Go (https://go.dev/dl) or run scripts\setup-go.bat to fetch it locally.
+    echo Install Go from https://go.dev/dl, or run scripts\setup-go.bat to fetch it locally.
     exit /b 1
   )
 )
