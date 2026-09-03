@@ -292,25 +292,43 @@ func (m *Manager) WebRTCOffer(ctx context.Context, streamPath, offer string) (st
 	// (POST /<path>/whep) on its WebRTC port. It answers with 201 Created
 	// and the SDP answer in the body.
 	url := fmt.Sprintf("%s/%s/whep", m.webrtcBase, streamPath)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBufferString(offer))
-	if err != nil {
-		return "", err
+	// MediaMTX's WHEP endpoint can bind a few hundred ms AFTER its control API
+	// reports ready, so the first offer right after a server start may hit a
+	// not-yet-listening port (connection refused). Retry only transient
+	// transport errors for a short window so the browser never sees a one-shot
+	// 502 - logical status errors (4xx/5xx) are returned immediately.
+	const tries = 4
+	var lastErr error
+	for attempt := 0; attempt < tries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBufferString(offer))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/sdp")
+		resp, err := m.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue // upstream not reachable yet - retry
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+			b, _ := io.ReadAll(resp.Body)
+			return "", fmt.Errorf("webrtc signaling status %d: %s", resp.StatusCode, string(b))
+		}
+		buf := new(bytes.Buffer)
+		if _, err := buf.ReadFrom(resp.Body); err != nil {
+			return "", err
+		}
+		return buf.String(), nil
 	}
-	req.Header.Set("Content-Type", "application/sdp")
-	resp, err := m.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("webrtc signaling status %d: %s", resp.StatusCode, string(b))
-	}
-	buf := new(bytes.Buffer)
-	if _, err := buf.ReadFrom(resp.Body); err != nil {
-		return "", err
-	}
-	return buf.String(), nil
+	return "", fmt.Errorf("webrtc signaling failed after %d tries: %w", tries, lastErr)
 }
 
 // logWriter adapts MediaMTX's stdout/stderr to our leveled logger, line by line.
