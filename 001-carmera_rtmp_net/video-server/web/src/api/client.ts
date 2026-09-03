@@ -34,9 +34,11 @@ export interface StreamInfo {
     signaling: string
     path: string
   }
-  /** Same-origin HLS playlist, proxied by the server (fallback for phones). */
+  /** Same-origin HLS playlist, proxied by the server. Reserved for a future
+   *  cached-recording playback feature - NOT used by the live player (live
+   *  viewing is WebRTC only; HLS adds seconds of latency). */
   hls_url?: string
-  /** Direct MediaMTX HLS URL, for debugging with an external player. */
+  /** Direct MediaMTX HLS URL, for debugging / future playback with an external player. */
   hls_direct_url?: string
 }
 

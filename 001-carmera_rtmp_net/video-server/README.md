@@ -147,8 +147,8 @@ start_oneclick.bat --no-pause      # 无人值守
 | `[5/5]` summary | 打印各产物字节数 / mtime，并给出下一步命令 | — |
 
 > 为什么 `[2/5]` 要"失败后重装依赖再试一次"：`node_modules` 存在**只证明曾经装过**，不等于装全。
-> 实测踩过一次 —— `hls.js` 是后加进 `package.json` 的依赖，`node_modules` 还停在旧时间，
-> Vite 直接 `Rollup failed to resolve import "hls.js"`。若不想重装而只想跳过：`--skip-web`。
+> 若 `vite build` 报 `Rollup failed to resolve import "xxx"`，先重装依赖再试。前端实时播放器
+> 不依赖 `hls.js`（HLS 仅服务端保留，供后续录播回放）；若只想跳过前端构建：`--skip-web`。
 
 **两个脚本的统一约定**
 
@@ -268,9 +268,9 @@ curl http://<任意本机IP>:8081/api/net/addresses
 |---|---|---|
 | 浏览器 `ERR_CONNECTION_TIMED_OUT` | Windows 防火墙拦掉入站（最常见） | 管理员运行 `scripts\firewall-add.bat`（或显式给端口：`scripts\firewall-add.bat 8081 8554 8889 8888`） |
 | `ERR_CONNECTION_REFUSED` | 服务没起来 / 端口被占 | 看日志里的 `HTTP listen` 行；换 `server.http_port` |
-| 打得开页面但播放失败 | 媒体的 UDP 侧被拦 | 放行 `mediamtx.exe` 程序规则（`firewall-add.bat` 已加）；或改用下面的 HLS 兜底 |
+| 打得开页面但播放失败 | 媒体的 UDP 侧被拦 | 放行 `mediamtx.exe` 程序规则（`firewall-add.bat` 已加）；仍不行给服务套 HTTPS（见 6.2） |
 | 地址不对（192.168 之外） | 选到了虚拟网卡 | 显式写 `server.host: 192.168.x.x` |
-| **网页能开、列表正常，但手机上没有画面** | WebRTC 在手机侧失败（详见 6.2） | 详见 6.2；播放器会自动降级到 HLS |
+| **网页能开、列表正常，但手机上没有画面** | WebRTC 在手机侧失败（详见 6.2） | 详见 6.2；播放器会**直接显示 WebRTC 失败原因**（不再降级 HLS），多为 http 下 WebRTC 被拒 → 套 HTTPS |
 
 撤销放行规则：`scripts\firewall-remove.bat`。
 
@@ -288,28 +288,27 @@ curl http://<任意本机IP>:8081/api/net/addresses
    ```
 2. **移动端 WebKit 在 http（非安全上下文）下拒绝 WebRTC。**
    iOS 上所有浏览器都是 WebKit 内核，所以 iPhone 的 Chrome 与 Safari 表现一致 —— 这正是
-   "两个浏览器都不行"的原因。此时 WebRTC 救不回来，只能走下面的 HLS 兜底（或给服务套 HTTPS）。
+   "两个浏览器都不行"的原因。此时 WebRTC 救不回来，正解是给服务套 HTTPS（见下方说明），而不是退回 HLS。
 3. **自动播放被拦截**（低电量/省流模式）：播放器会显示 `TAP TO PLAY`，点一下即可。
 
-**兜底通道：HLS（同源 + 纯 HTTP/TCP）**
+**实时播放不再使用 HLS 兜底（2026-09-03）**
 
-服务端把 MediaMTX 的 HLS 代理到 `/hls/<stream>/index.m3u8`，前端在 WebRTC 7 秒内未出画
-或 ICE 失败时自动切换过去：
+Web 端实时视频流**只走 WebRTC**：延迟亚秒级，符合实时监控需求。HLS 因分段式固有延迟
+（见 6.3，端到端 2-3.5s 起）在实时场景无价值，已从前端播放器移除 —— WebRTC 失败时播放器
+**直接显示失败原因**（`WEBRTC` 通道 + 一行错误说明），不再静默降级到 HLS。
 
-- 同源：无 CORS、无混合内容，手机只需要开放 HTTP 这一个端口；
-- 纯 TCP：绕开 UDP 限制，也绕开 http 下 WebRTC 被拒的问题；
-- iOS Safari 原生支持 HLS，Android Chrome 由 hls.js 播放；
-- 代价是延迟比 WebRTC 高一个量级（详见 6.3），所以它只是兜底，不是首选。
+> 这意味着：若手机端 WebRTC 因 **http 非安全上下文** 被拒（iOS WebKit 必现），**唯一正解**
+> 是给服务套 HTTPS（自签或证书），而不是退回 HLS。HLS 的同源/纯 TCP 优势在实时场景让位于延迟。
 
-播放器右上角可手动在 `WebRTC` / `HLS` 之间切换；左上角显示当前实际通道
-（`WEBRTC` 或 `HLS (fallback)`），下方一行显示失败原因 —— 手机端直接可见，不必开 devtools。
+**服务端 HLS 保留（用于后续录播回放）**：`/hls/<stream>/index.m3u8` 代理与 MediaMTX HLS 产出
+保持不变，未来"缓存录像查看"功能会复用它；前端 `StreamInfo.hls_url` / `hls_direct_url` 字段也
+保留，待回放页接入。手工验证服务端仍在产 HLS（不经过浏览器）：
 
-手工验证 HLS 链路（不经过浏览器）：
 ```bash
 curl http://<server-ip>:8081/hls/camera01/index.m3u8
 ```
 
-### 6.3 HLS 时延为什么高，以及已做的低延迟调优（2026-09-02）
+### 6.3 HLS 时延特性（服务端保留，用于后续录播回放）
 
 HLS 端到端时延 ≈ **发布端滞后** + **hls.js frontier gap**：
 
@@ -322,8 +321,9 @@ HLS 端到端时延 ≈ **发布端滞后** + **hls.js frontier gap**：
 GOP=4s，服务端就出 4 秒的分段，frontier gap 会按 4 秒一级放大。**要让 HLS 时延可控，推流端 GOP 必须
 ≈1s**（`camera-agent --auto` 已内置 keyint=fps 修正，自动保证 1 秒一个关键帧）。
 
-**前端低延迟参数（`web/src/webrtc/player.ts`）**：`liveSyncDurationCount:1`、
-`liveMaxLatencyDurationCount:6`、`maxLiveSyncPlaybackRate:2`（落后过多时快进追赶）、`maxBufferLength:8`。
+**前端低延迟参数（已随 web HLS 播放器移除，2026-09-03）**：原 `web/src/webrtc/player.ts` 中的
+`liveSyncDurationCount:1` / `liveMaxLatencyDurationCount:6` / `maxLiveSyncPlaybackRate:2` /
+`maxBufferLength:8` 等 hls.js 调优参数已不再使用；待录播回放页接入 HLS 时再酌情复用。
 
 实测（`scripts/hls_latency_probe.js A|B|C`，chromium 注入 hls.js 读 level details）：
 
@@ -334,8 +334,8 @@ GOP=4s，服务端就出 4 秒的分段，frontier gap 会按 4 秒一级放大�
 | **sync1 + 追帧 2×（当前）** | ~0.5-1s | ~2.4s |
 
 真机（合成源 + 真实 App 点 HLS）发布端滞后中位 0.75s。**预期端到端 HLS 时延 ~2-3.5s**（浏览器侧
-贡献已从 ~2.4s 降到 ~0.5-1s）。WebRTC 为亚秒级 —— 若业务需要 <1s 的实时性，应走 WebRTC（或 LL-HLS），
-HLS 只作兼容兜底。iOS Safari 走原生播放器、无上述旋钮，缓冲更大属预期。
+贡献已从 ~2.4s 降到 ~0.5-1s）。WebRTC 为亚秒级，实时场景走 WebRTC；HLS 不再用于实时播放，仅服务端
+保留供后续录播回放。iOS Safari 走原生播放器、无上述旋钮，缓冲更大属预期。
 
 延迟复测：`scripts/hls_latency_probe.js C`（需先起服务并推流，见 §8 的 ffmpeg 命令）。
 

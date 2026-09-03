@@ -2,7 +2,7 @@
   <div class="player-wrap">
     <video ref="videoEl" autoplay playsinline muted></video>
 
-    <!-- AI tracking-box overlay. Pointer-events disabled so the WebRTC / HLS /
+    <!-- AI tracking-box overlay. Pointer-events disabled so the WebRTC /
          fullscreen controls above stay clickable. The canvas is drawn from the
          latest GET /api/cameras/{id}/metadata frame, scaled to the displayed
          video size. -->
@@ -21,11 +21,8 @@
     </div>
 
     <div class="player-tools">
-      <button class="tool-btn" :class="{ active: status.transport === 'webrtc' }" @click="player?.useWebRTC()">
+      <button class="tool-btn" :class="{ active: status.transport === 'webrtc' }" @click="player?.useWebRTC()" title="Reconnect via WebRTC">
         WebRTC
-      </button>
-      <button class="tool-btn" :class="{ active: status.transport === 'hls' }" @click="player?.useHLS()">
-        HLS
       </button>
       <button class="tool-btn" @click="fullscreen" title="Fullscreen">
         <el-icon><FullScreen /></el-icon>
@@ -62,8 +59,6 @@ const stateText = computed(() => {
   switch (status.state) {
     case 'connected':
       return 'CONNECTED'
-    case 'fallback':
-      return 'PLAYING'
     case 'connecting':
       return 'CONNECTING'
     case 'reconnecting':
@@ -75,11 +70,11 @@ const stateText = computed(() => {
   }
 })
 
-// Naming the transport in the UI is what makes a phone-only failure debuggable:
-// "HLS (fallback)" tells you immediately that WebRTC did not make it.
+// Naming the transport in the UI makes a failure debuggable at a glance. Live
+// viewing is WebRTC only - there is no HLS fallback, so a problem shows up as a
+// WEBRTC error rather than silently dropping to a high-latency stream.
 const transportLabel = computed(() => {
   if (status.transport === 'webrtc') return 'WEBRTC'
-  if (status.transport === 'hls') return 'HLS (fallback)'
   return '—'
 })
 
