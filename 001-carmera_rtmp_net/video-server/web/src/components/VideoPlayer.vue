@@ -22,7 +22,9 @@
 
     <!-- AI mode selector. ai-off only hides the overlay (the agent keeps its
          model); ai-y / ai-y-pose POST to the server so the agent polls and
-         swaps its detector, then the overlay redraws on the next frame. -->
+         swaps its detector. On switch we clear the overlay at once and only
+         resume drawing once an incoming frame matches the new mode - any
+         intermediate frame from the still-swapping model is discarded. -->
     <div class="ai-mode-bar">
       <button
         v-for="m in aiModeOptions"
@@ -73,9 +75,17 @@ const aiModeOptions = [
 async function selectAIMode(m: AIMode) {
   if (aiSwitching.value || m === aiMode.value) return
   aiSwitching.value = true
+  // Close the AI overlay immediately. The agent is still running the previous
+  // model until its poller swaps the detector (~1s), so its next frames belong
+  // to the OLD mode. pollMetadata() also drops those intermediate frames until
+  // the incoming data matches the newly selected mode - we never composite a
+  // stale detect box over a pose view (or vice versa). This is what prevents
+  // the "multiple boxes" artifact during a switch.
+  closeOverlayNow()
   try {
     // POST the desired mode; the agent polls GET /api/cameras/{id}/aimode and
-    // swaps its detector at runtime. The overlay redraws on the next frame.
+    // swaps its detector at runtime. The overlay resumes only once a frame of
+    // the matching mode arrives.
     await api.setAIMode(props.cameraId, m)
     aiMode.value = m
   } catch (e) {
@@ -83,6 +93,18 @@ async function selectAIMode(m: AIMode) {
   } finally {
     aiSwitching.value = false
   }
+}
+
+// Clear the overlay canvas right now (called the moment a mode switch starts so
+// stale boxes disappear before the agent has finished swapping its model).
+function closeOverlayNow() {
+  const canvas = canvasEl.value
+  if (!canvas) return
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  clearOverlay(canvas, ctx)
+  aiOn.value = false
+  objectCount.value = 0
 }
 
 async function loadAIMode() {
@@ -154,6 +176,17 @@ const KP_MIN_CONF = 0.2
 // layout. Missing frame / 0 detected objects simply clears the canvas.
 const META_INTERVAL_MS = 200
 
+// Infer the model that produced a metadata frame. A pose frame carries 17
+// keypoints per object; a detection frame carries only bboxes. This lets us
+// drop frames from the previous model during a runtime detector swap.
+function dataModeOf(snap: MetadataSnapshot): AIMode | 'none' {
+  if (!snap.frame || snap.frame.objects.length === 0) return 'none'
+  const hasPose = snap.frame.objects.some(
+    (o) => o.keypoints != null && o.keypoints.length === 17
+  )
+  return hasPose ? 'ai-y-pose' : 'ai-y'
+}
+
 async function pollMetadata() {
   const canvas = canvasEl.value
   const video = videoEl.value
@@ -174,6 +207,19 @@ async function pollMetadata() {
 
   // ai-off: the agent keeps its model, we just do not draw anything.
   if (aiMode.value === 'ai-off') {
+    clearOverlay(canvas, ctx)
+    aiOn.value = false
+    objectCount.value = 0
+    return
+  }
+
+  // Infer which model produced this frame. While the agent is still swapping
+  // detectors after a web switch it may emit frames from the *previous* model
+  // (detect -> bbox only; pose -> bbox + 17 keypoints). Drop those intermediate
+  // frames so the UI never composites a stale/mismatched box or skeleton. We
+  // only draw once the incoming data agrees with the selected mode.
+  const dataMode = dataModeOf(snap)
+  if (dataMode !== 'none' && dataMode !== aiMode.value) {
     clearOverlay(canvas, ctx)
     aiOn.value = false
     objectCount.value = 0
