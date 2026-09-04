@@ -163,48 +163,111 @@ func TestLatestOnUnknownCameraIsEmptyNotError(t *testing.T) {
 	}
 }
 
-// Pruning is what keeps a 5 msg/s stream from growing the DB forever.
-func TestPruneKeepsNewestRowsPerCamera(t *testing.T) {
-	r := newTestRepo(t, 10)
+// ai_object holds ONLY the latest frame's objects per camera (deleted and
+// re-inserted on every SaveFrame). This test locks in that contract: a long
+// stream must never accumulate history, and the newest frame must always win.
+func TestAObjectHoldsOnlyLatestFrame(t *testing.T) {
+	r := newTestRepo(t, 0)
 	for i := 0; i < 20; i++ {
 		f := sampleFrame("camera01", int64(i))
+		f.Objects = f.Objects[:1] // one object per frame keeps the count trivial
 		if err := r.SaveFrame(f, time.Now()); err != nil {
 			t.Fatalf("save %d: %v", i, err)
 		}
 	}
-	// 20 frames x 2 objects = 40 rows written; only the newest 10 may survive.
+	snap, err := r.Latest("camera01")
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if len(snap.Frame.Objects) != 1 {
+		t.Fatalf("objects = %d, want 1 (only the latest frame survives)", len(snap.Frame.Objects))
+	}
+	if snap.Frame.FrameID != 19 {
+		t.Errorf("frame_id = %d, want 19 (latest must win)", snap.Frame.FrameID)
+	}
+	// DB must hold exactly one frame's worth of objects, not 20 x 1.
 	var n int
 	if err := r.db.QueryRow(`SELECT COUNT(*) FROM ai_object WHERE camera_id='camera01'`).Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
-	if n > 10 {
-		t.Errorf("rows = %d, want <= 10 (retention=10)", n)
-	}
-	// The surviving rows must be the NEWEST ones, not an arbitrary subset.
-	var minFrame int64
-	if err := r.db.QueryRow(`SELECT MIN(frame_id) FROM ai_object WHERE camera_id='camera01'`).Scan(&minFrame); err != nil {
-		t.Fatalf("min frame: %v", err)
-	}
-	if minFrame != 15 {
-		t.Errorf("oldest surviving frame_id = %d, want 15 (frames 15..19 x 2 objects = 10)", minFrame)
+	if n != 1 {
+		t.Errorf("rows = %d, want 1 (no history retained)", n)
 	}
 }
 
-// Retention <= 0 means "keep everything"; documented as an opt-in footgun.
-func TestRetentionZeroKeepsEverything(t *testing.T) {
+// REGRESSION: the agent's frame_id counter resets across restarts, so the same
+// frame_id can refer to different runs. In the old append-only design, a pose
+// run's keypoints (frame_id 4179 in ai-y-pose) leaked onto a later
+// person-detect run sharing that same frame_id (4179 in ai-y) - the web then
+// drew skeletons while in detect-only mode.
+//
+// ai_object now holds ONLY the latest frame's objects (delete + insert), so the
+// second run must fully replace the first's objects with zero keypoints.
+func TestPoseObjectsDoNotLeakIntoDetectMode(t *testing.T) {
 	r := newTestRepo(t, 0)
-	for i := 0; i < 10; i++ {
-		if err := r.SaveFrame(sampleFrame("camera01", int64(i)), time.Now()); err != nil {
-			t.Fatalf("save %d: %v", i, err)
-		}
+
+	// Run #1: pose mode, 2 people WITH 17 COCO keypoints each.
+	pose := &FrameMessage{
+		Version: 1, Type: TypeFrame, CameraID: "camera01",
+		FrameID: 4179, Timestamp: 1756773210123,
+		VideoWidth: 1280, VideoHeight: 720, AIMode: AIModePose,
+		Objects: []Object{
+			{Class: "person", Confidence: 0.9, TrackID: 1, BBox: [4]int{10, 20, 100, 200}, Keypoints: samplePose()},
+			{Class: "person", Confidence: 0.8, TrackID: 2, BBox: [4]int{110, 120, 200, 300}, Keypoints: samplePose()},
+		},
 	}
+	if err := r.SaveFrame(pose, time.Now()); err != nil {
+		t.Fatalf("save pose run: %v", err)
+	}
+
+	// Run #2: agent restarts (frame_id counter resets to the SAME value),
+	// mode is now person-detection only (no pose head -> no keypoints emitted).
+	detect := &FrameMessage{
+		Version: 1, Type: TypeFrame, CameraID: "camera01",
+		FrameID: 4179, Timestamp: 1756773215000,
+		VideoWidth: 1280, VideoHeight: 720, AIMode: AIModeDetect,
+		Objects: []Object{
+			{Class: "person", Confidence: 0.95, TrackID: 5, BBox: [4]int{40, 50, 140, 240}},
+		},
+	}
+	if err := r.SaveFrame(detect, time.Now()); err != nil {
+		t.Fatalf("save detect run: %v", err)
+	}
+
+	snap, err := r.Latest("camera01")
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if snap.Frame == nil {
+		t.Fatal("frame missing from snapshot")
+	}
+	if snap.Frame.AIMode != AIModeDetect {
+		t.Errorf("ai_mode = %q, want %q", snap.Frame.AIMode, AIModeDetect)
+	}
+	if len(snap.Frame.Objects) != 1 {
+		t.Fatalf("objects = %d, want 1 (pose run's objects must be gone)", len(snap.Frame.Objects))
+	}
+	if len(snap.Frame.Objects[0].Keypoints) != 0 {
+		t.Errorf("detect-mode object carries %d keypoints (pose leak)", len(snap.Frame.Objects[0].Keypoints))
+	}
+	// The DB must hold exactly the one detect-mode object, nothing from pose.
 	var n int
-	if err := r.db.QueryRow(`SELECT COUNT(*) FROM ai_object`).Scan(&n); err != nil {
+	if err := r.db.QueryRow(`SELECT COUNT(*) FROM ai_object WHERE camera_id='camera01'`).Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
-	if n != 20 {
-		t.Errorf("rows = %d, want 20 (pruning disabled)", n)
+	if n != 1 {
+		t.Errorf("rows = %d, want 1 (pose rows must be purged)", n)
 	}
+}
+
+// samplePose returns 17 COCO keypoints ([x,y,conf] each), the marker of a pose
+// model's output.
+func samplePose() [][3]float64 {
+	kp := make([][3]float64, 17)
+	for i := range kp {
+		kp[i] = [3]float64{float64(i * 10), float64(i * 8), 0.9}
+	}
+	return kp
 }
 
 func TestListAndCameraIDs(t *testing.T) {

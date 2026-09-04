@@ -102,3 +102,11 @@ Windows PC 摄像头 → GStreamer → H.264 → RTSP 推流，模拟未来 RK35
   项目级 `D:\user_project\git\SOC-Agent\.workbuddy\skills\soc-edge-ai-zerodep/SKILL.md`。
   **改一处必须两边同步**（2026-09-03 同步过一次）。
 - 项目级 skills 目录另有 `soc-camera-rtsp-agent`、`soc-windows-gstreamer-build`（主架构 / MSVC 构建）。
+
+## video-server SQLite 并发铁律（2026-09-04 修）
+- `database.Open` 必须开 **WAL**（`journal_mode=WAL` + `synchronous=NORMAL` + `busy_timeout` + `SetMaxOpenConns`），
+  否则回滚日志下 agent 写事务 / web 读 / monitor UPSERT 互相阻塞 → 偶发 `SQLITE_BUSY`。
+- handler 严禁把瞬时锁误判为永久错误：`getCamera`/`cameraStream` 的 `repo.Get` 错误=404、`cameraMetadata` 的
+  `meta.Latest` 错误=500 曾因此误报。
+- 所有读写路径包 `dbutil.RetryOnBusy`（仅在 "database is locked"/SQLITE_BUSY/(5) 时重试）；
+  真正缺失的相机仍返回 404（语义正确）。回归测试 `internal/database/concurrent_test.go`。

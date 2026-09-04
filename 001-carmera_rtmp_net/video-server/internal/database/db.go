@@ -11,6 +11,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"video-server/internal/logger"
 	"video-server/internal/metadata"
 )
 
@@ -22,8 +23,13 @@ func Open(path string) (*sql.DB, error) {
 			return nil, fmt.Errorf("create db dir: %w", err)
 		}
 	}
-	// busy_timeout avoids "database is locked" under concurrent access.
-	dsn := path + "?_pragma=busy_timeout(5000)"
+	// busy_timeout avoids "database is locked" under concurrent access, and
+	// WAL lets the web's per-second reads run concurrently with the agent's
+	// constant metadata write transactions instead of blocking on them
+	// (rollback-journal mode made every read collide with the writer and
+	// surface as a spurious 404/500). synchronous=NORMAL keeps WAL safe but
+	// cheap.
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -31,6 +37,18 @@ func Open(path string) (*sql.DB, error) {
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
+	// Guarantee WAL at the file level. It is idempotent and persists across
+	// connections and restarts, so even connections opened before this line
+	// (and every future process) inherit WAL. Best-effort: if a deployment
+	// cannot create the -wal/-shm sidecar files we still start and fall back
+	// to busy_timeout + the repo-level RetryOnBusy wrapper.
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		logger.Warn("database: could not enable WAL (continuing with rollback journal): %v", err)
+	}
+	// A small pool is enough: WAL permits concurrent readers against the single
+	// writer, so we keep throughput without inviting lock contention.
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
 	if err := migrate(db); err != nil {
 		return nil, fmt.Errorf("migrate db: %w", err)
 	}

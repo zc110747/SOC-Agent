@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"video-server/internal/dbutil"
 )
 
 // Repository provides CRUD and camera-discovery operations over the cameras table.
@@ -94,10 +96,15 @@ func (r *Repository) List() ([]Camera, error) {
 
 // Get returns the camera with the given id.
 func (r *Repository) Get(id string) (Camera, error) {
-	row := r.db.QueryRow(`
-		SELECT id,name,stream_path,device_ip,status,resolution,fps,bitrate,created_at,updated_at,last_seen
-		FROM cameras WHERE id = ?`, id)
-	c, err := r.scanRow(row)
+	var c Camera
+	err := dbutil.RetryOnBusy(3, func() error {
+		row := r.db.QueryRow(`
+			SELECT id,name,stream_path,device_ip,status,resolution,fps,bitrate,created_at,updated_at,last_seen
+			FROM cameras WHERE id = ?`, id)
+		var e error
+		c, e = r.scanRow(row)
+		return e
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return c, fmt.Errorf("camera %q not found", id)
 	}
@@ -106,10 +113,15 @@ func (r *Repository) Get(id string) (Camera, error) {
 
 // GetByStreamPath returns the camera matching a stream path.
 func (r *Repository) GetByStreamPath(path string) (Camera, error) {
-	row := r.db.QueryRow(`
-		SELECT id,name,stream_path,device_ip,status,resolution,fps,bitrate,created_at,updated_at,last_seen
-		FROM cameras WHERE stream_path = ?`, path)
-	c, err := r.scanRow(row)
+	var c Camera
+	err := dbutil.RetryOnBusy(3, func() error {
+		row := r.db.QueryRow(`
+			SELECT id,name,stream_path,device_ip,status,resolution,fps,bitrate,created_at,updated_at,last_seen
+			FROM cameras WHERE stream_path = ?`, path)
+		var e error
+		c, e = r.scanRow(row)
+		return e
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return c, fmt.Errorf("camera with stream_path %q not found", path)
 	}
@@ -205,8 +217,11 @@ func (r *Repository) UpsertByStreamPath(path string, status Status, lastSeen tim
 			existing.Bitrate = bitrate
 		}
 		args = append(args, existing.ID)
-		if _, uerr := r.db.Exec(
-			`UPDATE cameras SET `+strings.Join(setCols, ", ")+` WHERE id=?`, args...); uerr != nil {
+		if uerr := dbutil.RetryOnBusy(3, func() error {
+			_, e := r.db.Exec(
+				`UPDATE cameras SET `+strings.Join(setCols, ", ")+` WHERE id=?`, args...)
+			return e
+		}); uerr != nil {
 			return existing, uerr
 		}
 		existing.LastSeen = &lastSeen
@@ -233,11 +248,13 @@ func (r *Repository) UpsertByStreamPath(path string, status Status, lastSeen tim
 // MarkOfflineIfNotSeen flips cameras that have not been seen since threshold to
 // offline. This implements the ONLINE -> OFFLINE timeout transition.
 func (r *Repository) MarkOfflineIfNotSeen(threshold time.Time) error {
-	_, err := r.db.Exec(`
-		UPDATE cameras SET status='offline', updated_at=?
-		WHERE (last_seen IS NULL OR last_seen < ?) AND status != 'offline'`,
-		time.Now().UTC().Format(timeFmt), threshold.UTC().Format(timeFmt))
-	return err
+	return dbutil.RetryOnBusy(3, func() error {
+		_, err := r.db.Exec(`
+			UPDATE cameras SET status='offline', updated_at=?
+			WHERE (last_seen IS NULL OR last_seen < ?) AND status != 'offline'`,
+			time.Now().UTC().Format(timeFmt), threshold.UTC().Format(timeFmt))
+		return err
+	})
 }
 
 func nullStr(s string) any {

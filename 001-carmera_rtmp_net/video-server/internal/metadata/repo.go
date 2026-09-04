@@ -4,9 +4,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"time"
 
+	"video-server/internal/dbutil"
 	"video-server/internal/logger"
 )
 
@@ -16,32 +16,22 @@ import (
 //
 //	ai_status  one row per camera, overwritten on every heartbeat  (latest only)
 //	ai_frame   one row per camera, overwritten on every result     (latest only)
-//	ai_object  append-only detail rows, pruned to a bounded window
+//	ai_object  the latest frame's detected objects, one set per camera (latest only)
 //
-// Keeping the "latest" rows separate is what makes GET cheap: the UI polls it
-// every second or so, and it must never scan a growing history table.
+// All three tables hold ONLY the latest result per camera. The web reads
+// GET /metadata once per poll and must never scan a growing history. ai_object
+// is replaced (delete + insert) on every frame so a reused frame_id - the agent
+// counter resets across restarts - can never return a stale prior run's objects
+// (e.g. pose skeletons leaking into person-detect mode).
 type Repository struct {
 	db *sql.DB
-
-	mu        sync.Mutex
-	saveCount int
-	// pruneEvery is how many frame saves happen between two prune passes.
-	// Pruning on every write would turn a 5 msg/s stream into 5 DELETEs/s;
-	// doing it periodically keeps the write path to one INSERT per object.
-	pruneEvery int
-	// retention is the number of object rows kept per camera. <=0 disables
-	// pruning entirely (the table then grows without bound - opt in knowingly).
-	retention int
 }
 
-// NewRepository builds a metadata repository.
-//   - retention: object rows kept per camera (<=0 = unlimited)
-//   - pruneEvery: frames between two prune passes (<=0 falls back to 64)
-func NewRepository(db *sql.DB, retention, pruneEvery int) *Repository {
-	if pruneEvery <= 0 {
-		pruneEvery = 64
-	}
-	return &Repository{db: db, retention: retention, pruneEvery: pruneEvery}
+// NewRepository builds a metadata repository. The retention/pruneEvery args are
+// retained only for call-site compatibility; ai_object now holds just the latest
+// frame's objects, so no history or pruning is kept.
+func NewRepository(db *sql.DB, _ /*retention*/, _ /*pruneEvery*/ int) *Repository {
+	return &Repository{db: db}
 }
 
 // Migrate creates the metadata tables. It is called from the shared schema
@@ -94,7 +84,7 @@ func Migrate(db *sql.DB) error {
 			camera_id TEXT PRIMARY KEY,
 			mode      TEXT NOT NULL
 		)`,
-		// Serves both the latest-frame lookup and the retention prune.
+		// Serves the latest-frame lookup.
 		`CREATE INDEX IF NOT EXISTS idx_ai_object_camera_id ON ai_object(camera_id, id)`,
 	}
 	for _, s := range stmts {
@@ -155,7 +145,16 @@ const timeFmt = time.RFC3339Nano
 
 // SaveFrame stores one inference result: it upserts the per-camera "latest
 // frame" row and appends the detected objects to the bounded history.
+// Transient SQLITE_BUSY (the agent posts many frames per second while the web
+// reads concurrently) is retried so a momentary writer collision never becomes
+// a 500 on the ingest endpoint.
 func (r *Repository) SaveFrame(f *FrameMessage, received time.Time) error {
+	return dbutil.RetryOnBusy(5, func() error {
+		return r.saveFrameOnce(f, received)
+	})
+}
+
+func (r *Repository) saveFrameOnce(f *FrameMessage, received time.Time) error {
 	now := received.UTC().Format(timeFmt)
 	recv := now
 
@@ -177,6 +176,17 @@ func (r *Repository) SaveFrame(f *FrameMessage, received time.Time) error {
 		f.CameraID, f.FrameID, f.Timestamp, f.VideoWidth, f.VideoHeight,
 		f.AIMode, len(f.Objects), recv, now); err != nil {
 		return fmt.Errorf("upsert ai_frame: %w", err)
+	}
+
+	// ai_object holds ONLY this frame's objects for the camera (mirroring the
+	// "latest only" contract of ai_frame). Deleting first is what makes the
+	// lookup in Latest() unambiguous: the agent's frame_id is NOT globally unique
+	// (it resets across restarts), so a naive append + "WHERE frame_id = ?" join
+	// would return stale objects from a previous run - e.g. pose skeletons from
+	// when the mode was ai-y-pose composited onto a current ai-y frame. Replacing
+	// the set on every frame prevents that leak entirely.
+	if _, err := tx.Exec(`DELETE FROM ai_object WHERE camera_id = ?`, f.CameraID); err != nil {
+		return fmt.Errorf("clear ai_object: %w", err)
 	}
 
 	ins, err := tx.Prepare(`
@@ -203,33 +213,35 @@ func (r *Repository) SaveFrame(f *FrameMessage, received time.Time) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit frame: %w", err)
 	}
-	r.maybePrune(f.CameraID)
 	return nil
 }
 
-// SaveStatus stores one AI heartbeat (latest per camera).
+// SaveStatus stores one AI heartbeat (latest per camera). Retried on transient
+// lock contention for the same reason as SaveFrame.
 func (r *Repository) SaveStatus(s *StatusMessage, received time.Time) error {
 	now := received.UTC().Format(timeFmt)
-	_, err := r.db.Exec(`
-		INSERT INTO ai_status
-			(camera_id,version,ai_enable,ai_running,ai_fps,model,tracker,
-			 last_frame_id,last_timestamp,processed,wall_clock,received_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(camera_id) DO UPDATE SET
-			version=excluded.version, ai_enable=excluded.ai_enable,
-			ai_running=excluded.ai_running, ai_fps=excluded.ai_fps,
-			model=excluded.model, tracker=excluded.tracker,
-			last_frame_id=excluded.last_frame_id,
-			last_timestamp=excluded.last_timestamp,
-			processed=excluded.processed, wall_clock=excluded.wall_clock,
-			received_at=excluded.received_at, updated_at=excluded.updated_at`,
-		s.CameraID, s.Version, boolInt(s.AI.Enable), boolInt(s.AI.Running), s.AI.FPS,
-		nullStr(s.AI.Model), nullStr(s.AI.Tracker),
-		s.AI.LastFrameID, s.AI.LastTimestamp, s.AI.Processed, s.WallClock, now, now)
-	if err != nil {
-		return fmt.Errorf("upsert ai_status: %w", err)
-	}
-	return nil
+	return dbutil.RetryOnBusy(3, func() error {
+		_, err := r.db.Exec(`
+			INSERT INTO ai_status
+				(camera_id,version,ai_enable,ai_running,ai_fps,model,tracker,
+				 last_frame_id,last_timestamp,processed,wall_clock,received_at,updated_at)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(camera_id) DO UPDATE SET
+				version=excluded.version, ai_enable=excluded.ai_enable,
+				ai_running=excluded.ai_running, ai_fps=excluded.ai_fps,
+				model=excluded.model, tracker=excluded.tracker,
+				last_frame_id=excluded.last_frame_id,
+				last_timestamp=excluded.last_timestamp,
+				processed=excluded.processed, wall_clock=excluded.wall_clock,
+				received_at=excluded.received_at, updated_at=excluded.updated_at`,
+			s.CameraID, s.Version, boolInt(s.AI.Enable), boolInt(s.AI.Running), s.AI.FPS,
+			nullStr(s.AI.Model), nullStr(s.AI.Tracker),
+			s.AI.LastFrameID, s.AI.LastTimestamp, s.AI.Processed, s.WallClock, now, now)
+		if err != nil {
+			return fmt.Errorf("upsert ai_status: %w", err)
+		}
+		return nil
+	})
 }
 
 // Latest returns the newest frame + status for one camera. Both may be nil when
@@ -244,10 +256,12 @@ func (r *Repository) Latest(cameraID string) (Snapshot, error) {
 		aiMode         string
 		receivedAt     string
 	)
-	err := r.db.QueryRow(`
-		SELECT frame_id,timestamp,video_width,video_height,ai_mode,object_count,received_at
-		FROM ai_frame WHERE camera_id = ?`, cameraID).
-		Scan(&frameID, &ts, &w, &h, &aiMode, &objCount, &receivedAt)
+	err := dbutil.RetryOnBusy(3, func() error {
+		return r.db.QueryRow(`
+			SELECT frame_id,timestamp,video_width,video_height,ai_mode,object_count,received_at
+			FROM ai_frame WHERE camera_id = ?`, cameraID).
+			Scan(&frameID, &ts, &w, &h, &aiMode, &objCount, &receivedAt)
+	})
 	switch {
 	case err == nil:
 		objs, oerr := r.objects(cameraID, frameID)
@@ -303,13 +317,17 @@ func (r *Repository) List() ([]Snapshot, error) {
 // CameraIDs returns every camera id present in either metadata table, most
 // recently updated first (bounded, so a stuck camera cannot starve the rest).
 func (r *Repository) CameraIDs() ([]string, error) {
-	rows, err := r.db.Query(`
-		SELECT camera_id, MAX(updated_at) AS u FROM (
-			SELECT camera_id, updated_at FROM ai_frame
-			UNION ALL
-			SELECT camera_id, updated_at FROM ai_status
-		) GROUP BY camera_id ORDER BY u DESC`)
-	if err != nil {
+	var rows *sql.Rows
+	if err := dbutil.RetryOnBusy(3, func() error {
+		var e error
+		rows, e = r.db.Query(`
+			SELECT camera_id, MAX(updated_at) AS u FROM (
+				SELECT camera_id, updated_at FROM ai_frame
+				UNION ALL
+				SELECT camera_id, updated_at FROM ai_status
+			) GROUP BY camera_id ORDER BY u DESC`)
+		return e
+	}); err != nil {
 		return nil, fmt.Errorf("list metadata cameras: %w", err)
 	}
 	defer rows.Close()
@@ -335,12 +353,14 @@ func (r *Repository) status(cameraID string) (*StatusView, error) {
 		model, tracker  sql.NullString
 		receivedAt      string
 	)
-	err := r.db.QueryRow(`
-		SELECT version,ai_enable,ai_running,ai_fps,model,tracker,
-		       last_frame_id,last_timestamp,processed,wall_clock,received_at
-		FROM ai_status WHERE camera_id = ?`, cameraID).
-		Scan(&s.Version, &enable, &running, &s.FPS, &model, &tracker,
-			&s.LastFrameID, &s.LastTimestamp, &s.Processed, &s.WallClock, &receivedAt)
+	err := dbutil.RetryOnBusy(3, func() error {
+		return r.db.QueryRow(`
+			SELECT version,ai_enable,ai_running,ai_fps,model,tracker,
+			       last_frame_id,last_timestamp,processed,wall_clock,received_at
+			FROM ai_status WHERE camera_id = ?`, cameraID).
+			Scan(&s.Version, &enable, &running, &s.FPS, &model, &tracker,
+				&s.LastFrameID, &s.LastTimestamp, &s.Processed, &s.WallClock, &receivedAt)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -353,11 +373,15 @@ func (r *Repository) status(cameraID string) (*StatusView, error) {
 }
 
 func (r *Repository) objects(cameraID string, frameID int64) ([]ObjectView, error) {
-	rows, err := r.db.Query(`
-		SELECT class,confidence,track_id,x1,y1,x2,y2,keypoints
-		FROM ai_object WHERE camera_id = ? AND frame_id = ? ORDER BY id ASC`,
-		cameraID, frameID)
-	if err != nil {
+	var rows *sql.Rows
+	if err := dbutil.RetryOnBusy(3, func() error {
+		var e error
+		rows, e = r.db.Query(`
+			SELECT class,confidence,track_id,x1,y1,x2,y2,keypoints
+			FROM ai_object WHERE camera_id = ? AND frame_id = ? ORDER BY id ASC`,
+			cameraID, frameID)
+		return e
+	}); err != nil {
 		return nil, fmt.Errorf("read ai_object: %w", err)
 	}
 	defer rows.Close()
@@ -378,45 +402,6 @@ func (r *Repository) objects(cameraID string, frameID int64) ([]ObjectView, erro
 		out = append(out, o)
 	}
 	return out, rows.Err()
-}
-
-// maybePrune trims the object history for one camera every pruneEvery saves.
-// It runs on the caller's goroutine: at 5 msg/s that is one DELETE every ~13s,
-// which is far cheaper than a background ticker and cannot leak a goroutine.
-func (r *Repository) maybePrune(cameraID string) {
-	if r.retention <= 0 {
-		return
-	}
-	r.mu.Lock()
-	r.saveCount++
-	due := r.saveCount%r.pruneEvery == 0
-	r.mu.Unlock()
-	if !due {
-		return
-	}
-	if err := r.Prune(cameraID, r.retention); err != nil {
-		logger.Warn("metadata prune %s failed: %v", cameraID, err)
-	}
-}
-
-// Prune keeps only the newest `keep` object rows for one camera.
-func (r *Repository) Prune(cameraID string, keep int) error {
-	if keep <= 0 {
-		return nil
-	}
-	res, err := r.db.Exec(`
-		DELETE FROM ai_object
-		WHERE camera_id = ?
-		  AND id NOT IN (
-			SELECT id FROM ai_object WHERE camera_id = ? ORDER BY id DESC LIMIT ?
-		  )`, cameraID, cameraID, keep)
-	if err != nil {
-		return fmt.Errorf("prune ai_object: %w", err)
-	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		logger.Debug("metadata pruned %d old object rows for %s", n, cameraID)
-	}
-	return nil
 }
 
 // DeleteCamera removes every metadata row for one camera. Used when the
@@ -442,8 +427,10 @@ func (r *Repository) DeleteCamera(cameraID string) error {
 // poller and the UI always get a usable value.
 func (r *Repository) GetAIMode(cameraID string) (string, error) {
 	var mode string
-	err := r.db.QueryRow(`SELECT mode FROM ai_aimode WHERE camera_id = ?`, cameraID).
-		Scan(&mode)
+	err := dbutil.RetryOnBusy(3, func() error {
+		return r.db.QueryRow(`SELECT mode FROM ai_aimode WHERE camera_id = ?`, cameraID).
+			Scan(&mode)
+	})
 	switch {
 	case err == sql.ErrNoRows:
 		return DefaultAIMode, nil
@@ -462,13 +449,15 @@ func (r *Repository) SetAIMode(cameraID, mode string) error {
 	if !ValidAIMode(mode) {
 		return fmt.Errorf("invalid ai mode %q (want ai-off|ai-y|ai-y-pose)", mode)
 	}
-	if _, err := r.db.Exec(`
-		INSERT INTO ai_aimode (camera_id, mode) VALUES (?, ?)
-		ON CONFLICT(camera_id) DO UPDATE SET mode = excluded.mode`,
-		cameraID, mode); err != nil {
-		return fmt.Errorf("upsert ai_aimode: %w", err)
-	}
-	return nil
+	return dbutil.RetryOnBusy(3, func() error {
+		if _, err := r.db.Exec(`
+			INSERT INTO ai_aimode (camera_id, mode) VALUES (?, ?)
+			ON CONFLICT(camera_id) DO UPDATE SET mode = excluded.mode`,
+			cameraID, mode); err != nil {
+			return fmt.Errorf("upsert ai_aimode: %w", err)
+		}
+		return nil
+	})
 }
 
 func boolInt(b bool) int {
