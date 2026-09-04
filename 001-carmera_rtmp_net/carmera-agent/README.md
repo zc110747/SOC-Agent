@@ -179,6 +179,17 @@ ai:
   log_objects: true            # 每帧打印检出对象
   num_threads: 2               # ONNX Runtime intra-op 线程
 
+# ---- 运行时 AI 模式切换（Web → video-server → agent 轮询）----
+# model_pose：姿态模型路径；Web 选 ai-y-pose 时运行时换此模型，无需重启。
+  model_pose: models/yolo11n-pose.onnx
+  # agent 主动轮询 video-server 的 GET /api/cameras/{id}/aimode 拿期望模式：
+  #   ai-off    -> 保持当前模型，仅 Web 隐藏 overlay（不通知 agent 停模型）
+  #   ai-y      -> 换 yolo11n（人检测）
+  #   ai-y-pose -> 换 yolo11n-pose（17 关键点姿态）
+  aimode_poll: true                            # false = 固定启动模型，不接受 Web 切换
+  aimode_poll_ms: 2000                         # 轮询周期
+  aimode_base_url: http://127.0.0.1:8081      # video-server HTTP 基址（joint 配置同端口）
+
 # ---- Metadata 分支（Phase 2：AI 结果异步上报；失败绝不影响视频/AI）----
 metadata:
   enable: false                                  # 启用结果上报
@@ -234,6 +245,10 @@ MediaMTX 从项目根目录启动时会自动加载本文件。`all_others` + �
 | `--ai-fps <n>` | 5 | AI 推理率（`source fps < full_rate_below_fps` 时改为每帧） |
 | `--ai-confidence <f>` | 0.5 | 检测+跟踪置信度门限 |
 | `--ai-model <path>` | `models/yolo11n.onnx` | ONNX 模型路径（检测/姿态自动识别） |
+| `--ai-model-pose <path>` | `models/yolo11n-pose.onnx` | 姿态模型路径（Web 切 ai-y-pose 时运行时换） |
+| `--ai-aimode-base <url>` | `http://127.0.0.1:8081` | 轮询 video-server 的基址（取 `/api/cameras/{id}/aimode`） |
+| `--ai-aimode-poll-ms <ms>` | 2000 | AI 模式轮询周期 |
+| `--no-ai-aimode` | - | 关闭 Web 驱动切换（固定启动模型，不接受 ai-y/ai-y-pose 切换） |
 | `--ai-input <w> <h>` | 640 640 | 网络输入尺寸 |
 | `--ai-queue <n>` | 2 | 有界队列深度 |
 | `--ai-full-rate-below <n>` | 10 | 源 fps 低于此值时改为每帧都跑 |
@@ -296,6 +311,22 @@ start-camera-agent.bat --camera 1 --no-auto --width 640 --height 480 --fps 30
 
 > 为什么必须"先等流就绪再开 ffplay"：agent 报 `STREAMING` 比 mediamtx 真正注册路径早约 1 秒，此时 ffplay 发 DESCRIBE 会拿到 `404 Not Found` 并立即退出。
 
+### Web 驱动 AI 模式切换（三态）
+
+控制链路：**Web UI → POST `/api/cameras/{id}/aimode` → video-server 落库 → agent 轮询 `GET /api/cameras/{id}/aimode` → 运行时换模型**。agent→server 是单向 WinHTTP POST（metadata），无反向通道，故采用 agent 主动轮询。
+
+三种模式（默认 `ai-y`）：
+
+| 模式 | 含义 | agent 行为 | Web 行为 |
+|------|------|-----------|----------|
+| `ai-off` | 关 AI 显示 | **不换模型**（保持启动模型），忽略该请求 | 仅隐藏检测框/骨架 overlay |
+| `ai-y` | 人检测 | 运行时换 `yolo11n`（Detect） | 画检测框 |
+| `ai-y-pose` | 姿态检测 | 运行时换 `yolo11n-pose`（Pose，17 关键点） | 画检测框 + COCO 骨架连线 |
+
+- 切换在 AI 线程内完成：ONNX 重新加载（慢，~数百 ms）在锁外进行，仅 `detector_` 指针交换这一步加锁，因此**绝不阻塞视频/采集线程**。
+- `ai-off` 不通知 agent 停模型（符合需求：只关界面显示）；`ai-y`/`ai-y-pose` 才会触发模型重建并重绘。
+- 单测 `ai_pipeline_switch_models` 验证 Detect↔Pose 运行时可切换且 `current_mode()`/`keypoint_count()` 同步；video-server 侧 `TestAIMode*`/`TestSaveFrameRoundTripsKeypoints` 覆盖落库、默认、非法拒绝、keypoints 透传。
+
 ---
 
 ## 验证流程
@@ -308,7 +339,7 @@ ctest --test-dir build-msvc --output-on-failure
 ctest --test-dir build --output-on-failure
 ```
 
-覆盖：摄像头枚举、管线创建、H264 编码、RTSP 连接、RTSP 断开、自动重连（退避 `1/2/5/10s` 封顶验证）、参数错误、正常退出、AI 端到端（detector 真图检出 + ByteTrack 稳定 ID + AIPipeline 生命周期）、YOLO11 解码（通道数判型、双布局合成张量、pose 17 关键点逆变换/conf 不二次 sigmoid）、pose 真模型回归（yolo11n-pose bus.jpg 4 人 17 关键点全落帧内）、Metadata 端到端（JSON 字段与 bbox 裁剪、空结果、心跳、有界队列、断服不阻塞、恢复后重连计数、配置解析）。**26/26 通过**。
+覆盖：摄像头枚举、管线创建、H264 编码、RTSP 连接、RTSP 断开、自动重连（退避 `1/2/5/10s` 封顶验证）、参数错误、正常退出、AI 端到端（detector 真图检出 + ByteTrack 稳定 ID + AIPipeline 生命周期）、YOLO11 解码（通道数判型、双布局合成张量、pose 17 关键点逆变换/conf 不二次 sigmoid）、pose 真模型回归（yolo11n-pose bus.jpg 4 人 17 关键点全落帧内）、**运行时 AI 模式切换（Detect↔Pose 不重启）**、Metadata 端到端（JSON 字段与 bbox 裁剪、空结果、心跳、有界队列、断服不阻塞、恢复后重连计数、配置解析）。**27/27 通过**。
 
 ### 2. 端到端验收（`scripts/e2e-test.ps1`，真实 GStreamer 后端）
 

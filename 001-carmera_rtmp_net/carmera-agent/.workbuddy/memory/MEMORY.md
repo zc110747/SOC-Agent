@@ -21,8 +21,8 @@ Windows PC 摄像头 → GStreamer → H.264 → RTSP 推流，模拟未来 RK35
 - `rtspclientsink` 自带 RTP payloader，管线里不要串 `rtph264pay`。
 
 ## 验收
-- 单测 **22/22**（10 基础 + 3 AI + 9 Metadata）；端到端 `scripts/e2e-test.ps1`
-  （MediaMTX 收流 + ffmpeg 拉帧 + 断服重连 + auto-resume）。
+- 单测 **27/27**（10 基础 + AI/YOLO11 解码/pose 真模型回归/运行时 AI 模式切换 + Metadata）；
+  端到端 `scripts/e2e-test.ps1`（MediaMTX 收流 + ffmpeg 拉帧 + 断服重连 + auto-resume）。
 - auto-resume 判定读 mediamtx.log（实时刷盘），不读 agent.log（stdout 缓冲陈旧）。
 - Metadata 验收用 `scripts/metadata-mock-server.py`（仅标准库；`--dump` / `--fail-after N` / `--die-after N`）。
 
@@ -45,6 +45,31 @@ Windows PC 摄像头 → GStreamer → H.264 → RTSP 推流，模拟未来 RK35
 - 对外暴露的 `stats().connected` 要取 `transport->connected() && !offline_`。
 - 该回归由单测 `metadata_reconnect_counted_on_recovery` 锁定（用 `connect()` 永不失败的
   `FlakyTransport` 注入 3 次 send 失败，断言 `reconnect==1 && failed==3`）。
+
+## Web 驱动 AI 模式切换（agent 轮询，2026-09-04 完成）
+- 三态：`ai-off`（仅 Web 隐藏 overlay，agent 不换模型）/ `ai-y`（yolo11n 人检测）/
+  `ai-y-pose`（yolo11n-pose 17 关键点姿态）。**默认 `ai-y`**。
+- 控制链路：Web `POST /api/cameras/{id}/aimode` → video-server 落 `ai_aimode` 表 →
+  agent 独立线程 `aimode_poll_loop` 轮询 `GET /api/cameras/{id}/aimode` 拿 `mode` 字段，
+  调 `AIPipeline::request_mode()` → AI 线程 `apply_mode()` 锁外重建 detector、锁内换 `detector_` 指针。
+- agent→server 是单向 WinHTTP POST（metadata），**无反向通道** → 故用 agent 主动轮询（不是 server 推送）。
+- `ai-off` 语义：agent 忽略该请求，**保持启动模型**；仅 Web 隐藏 overlay（符合需求：不通知停模型）。
+- `ai-y`/`ai-y-pose` 才触发运行时模型重建并重绘。`apply_mode` 慢的 ONNX 加载在锁外，指针交换才加锁 → 不阻塞视频/采集线程。
+- 协议/字段：`frame.objects[].keypoints` 为 `[x,y,conf]`，仅 pose 模型有；video-server `Object.Keypoints` 存 `ai_object.keypoints`（TEXT JSON）。
+- 测试：agent `ai_pipeline_switch_models`（Detect↔Pose 不重启）；video-server `TestAIMode*` + `TestSaveFrameRoundTripsKeypoints`；web `client.ts` 加 `AIMode`/`getAIMode`/`setAIMode`，`VideoPlayer.vue` 加三模式选择器 + COCO 骨架绘制。
+- **全链路 live e2e 已验证（2026-09-04 续做）**：真实 `video-server.exe` + 自带 MediaMTX + agent sim 后端
+  （`--source videotestsrc`，x264enc 软件编码兜底，无 GPU 亦可跑）跑通：curl `POST /api/cameras/camera01/aimode`
+  `{"mode":"ai-y-pose"}` → agent `aimode_poll_loop` 轮询命中 → 日志 `model switched -> mode=pose`（加载 yolo11n-pose.onnx），
+  `POST ai-y` → `model switched -> mode=detect`，**全程不重启**。ai-off 仅 Web 隐藏 overlay，agent 保持启动模型。
+  video-server API live 冒烟 8/8 通过（默认 ai-y / 往返 / 非法 400 / ai-off / 新相机默认）。
+
+## video-server schema 前向兼容（2026-09-04 修）
+- 现象：joint 运行 agent 推 metadata 时 server 回 `HTTP 500` —— `table ai_object has no column named keypoints`。
+  根因：`ai_object.keypoints` 列是 pose 模型需求新增的，但 `data/video.joint.db` 由旧 schema 创建；
+  `Migrate` 用 `CREATE TABLE IF NOT EXISTS` 对**已存在**的表不会加列，旧表缺列 → INSERT 失败。
+- 修复：`Migrate` 末尾加 `addColumnIfMissing(db,"ai_object","keypoints","TEXT")`（PRAGMA table_info 探测，
+  缺列才 `ALTER TABLE ... ADD COLUMN`）。旧库启动即自愈，无需手动清库。回归测试
+  `TestMigrateAddsKeypointsColumnToExistingDB`（造旧 schema → Migrate → SaveFrame 带 keypoints 成功落库）。
 
 ## 一键启动 / 目录约定（2026-08-31 新增）
 - 根目录 `start-camera-agent.bat`：一键启动脚本（纯英文 .bat）。

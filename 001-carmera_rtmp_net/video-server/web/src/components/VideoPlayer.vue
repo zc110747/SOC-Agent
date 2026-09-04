@@ -17,7 +17,23 @@
     <div class="player-status">
       <span class="transport">{{ transportLabel }}</span>
       <span class="state">{{ stateText }}</span>
-      <span v-if="aiOn" class="ai-badge">AI {{ objectCount }}</span>
+      <span v-if="aiOn && aiMode !== 'ai-off'" class="ai-badge">AI {{ objectCount }}</span>
+    </div>
+
+    <!-- AI mode selector. ai-off only hides the overlay (the agent keeps its
+         model); ai-y / ai-y-pose POST to the server so the agent polls and
+         swaps its detector, then the overlay redraws on the next frame. -->
+    <div class="ai-mode-bar">
+      <button
+        v-for="m in aiModeOptions"
+        :key="m.value"
+        class="mode-btn"
+        :class="{ active: aiMode === m.value }"
+        :disabled="aiSwitching"
+        @click="selectAIMode(m.value)"
+      >
+        {{ m.label }}
+      </button>
     </div>
 
     <div class="player-tools">
@@ -40,9 +56,46 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { FullScreen } from '@element-plus/icons-vue'
 import { StreamPlayer, type PlayerStatus } from '@/webrtc/player'
-import { api, type MetadataSnapshot } from '@/api/client'
+import { api, AI_MODES, DEFAULT_AI_MODE, type AIMode, type MetadataSnapshot } from '@/api/client'
 
 const props = defineProps<{ cameraId: string }>()
+
+// ---- AI mode (web-driven model selection) -----------------------------------
+//
+// ai-off      -> hide the overlay only; the agent keeps its loaded model.
+// ai-y        -> person detection (yolo11n).
+// ai-y-pose   -> person detection + 17 COCO keypoints (yolo11n-pose).
+const aiMode = ref<AIMode>(DEFAULT_AI_MODE)
+const aiSwitching = ref(false)
+const aiModeOptions = [
+  { value: 'ai-off' as AIMode, label: 'AI 关' },
+  { value: 'ai-y' as AIMode, label: '人检测' },
+  { value: 'ai-y-pose' as AIMode, label: '姿态' }
+]
+
+async function selectAIMode(m: AIMode) {
+  if (aiSwitching.value || m === aiMode.value) return
+  aiSwitching.value = true
+  try {
+    // POST the desired mode; the agent polls GET /api/cameras/{id}/aimode and
+    // swaps its detector at runtime. The overlay redraws on the next frame.
+    await api.setAIMode(props.cameraId, m)
+    aiMode.value = m
+  } catch (e) {
+    console.error('setAIMode failed', e)
+  } finally {
+    aiSwitching.value = false
+  }
+}
+
+async function loadAIMode() {
+  try {
+    const r = await api.getAIMode(props.cameraId)
+    if (AI_MODES.includes(r.mode)) aiMode.value = r.mode
+  } catch {
+    // Metadata disabled / not ready - fall back to the default (ai-y).
+  }
+}
 const videoEl = ref<HTMLVideoElement | null>(null)
 const canvasEl = ref<HTMLCanvasElement | null>(null)
 let player: StreamPlayer | null = null
@@ -89,6 +142,19 @@ function fullscreen() {
 
 // ---- AI metadata overlay ------------------------------------------------
 
+// COCO 17-joint skeleton (0-based indices), used to connect pose keypoints.
+// Order matches YOLO11n-pose output:
+// 0 nose, 1 leye, 2 reye, 3 lear, 4 rear, 5 lshoulder, 6 rshoulder, 7 lelbow,
+// 8 relbow, 9 lwrist, 10 rwrist, 11 lhip, 12 rhip, 13 lknee, 14 rknee,
+// 15 lankle, 16 rankle.
+const COCO_SKELETON: [number, number][] = [
+  [15, 13], [13, 11], [16, 14], [14, 12], [11, 12], [5, 11], [6, 12], [5, 6],
+  [5, 7], [6, 8], [7, 9], [8, 10], [1, 2], [0, 1], [0, 2], [1, 3], [2, 4]
+]
+// Keypoints below this confidence are drawn faintly / skipped for connections
+// so a spurious joint does not draw a stray line across the frame.
+const KP_MIN_CONF = 0.2
+
 // Poll the metadata endpoint and repaint the box overlay. The metadata frame
 // carries bbox in ORIGINAL video pixels; we scale by the video element's
 // actual rendered size so the boxes track the displayed stream regardless of
@@ -107,6 +173,14 @@ async function pollMetadata() {
     snap = await api.cameraMetadata(props.cameraId)
   } catch {
     // Metadata disabled / not ready yet - keep the overlay empty.
+    clearOverlay(canvas, ctx)
+    aiOn.value = false
+    objectCount.value = 0
+    return
+  }
+
+  // ai-off: the agent keeps its model, we just do not draw anything.
+  if (aiMode.value === 'ai-off') {
     clearOverlay(canvas, ctx)
     aiOn.value = false
     objectCount.value = 0
@@ -164,12 +238,48 @@ async function pollMetadata() {
     if (o.track_id > 0) {
       const tid = '#' + o.track_id
       ctx.fillStyle = 'rgba(0, 0, 0, 0.45)'
-      ctx.fillText(tid, rx + rw - ctx.measureText(tid).width - padX, ry + lh - 4)
+      ctx.fillText(tid, rx + rw - ctx.measureText(tid).width - padX, ly + lh - 4)
+    }
+
+    // Pose model: draw the 17-joint skeleton on top of the box.
+    if (o.keypoints && o.keypoints.length === 17) {
+      drawSkeleton(ctx, o.keypoints, sx, sy)
     }
   }
 
   aiOn.value = !!snap.status?.running
   objectCount.value = snap.frame.objects.length
+}
+
+// Draw COCO keypoint dots + skeleton connections for one object. kps are
+// [x, y, conf] in ORIGINAL video pixels; sx/sy scale them to the canvas.
+function drawSkeleton(
+  ctx: CanvasRenderingContext2D,
+  kps: [number, number, number][],
+  sx: number,
+  sy: number
+) {
+  // Connections first (under the dots).
+  ctx.strokeStyle = 'rgba(255, 196, 0, 0.9)'
+  ctx.lineWidth = 2
+  for (const [a, b] of COCO_SKELETON) {
+    const ka = kps[a]
+    const kb = kps[b]
+    if (!ka || !kb) continue
+    if (ka[2] < KP_MIN_CONF || kb[2] < KP_MIN_CONF) continue
+    ctx.beginPath()
+    ctx.moveTo(ka[0] * sx, ka[1] * sy)
+    ctx.lineTo(kb[0] * sx, kb[1] * sy)
+    ctx.stroke()
+  }
+  // Dots on top.
+  ctx.fillStyle = 'rgba(255, 240, 170, 0.95)'
+  for (const k of kps) {
+    if (k[2] < KP_MIN_CONF) continue
+    ctx.beginPath()
+    ctx.arc(k[0] * sx, k[1] * sy, 2.5, 0, Math.PI * 2)
+    ctx.fill()
+  }
 }
 
 function clearOverlay(canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D) {
@@ -185,6 +295,7 @@ onMounted(() => {
   }
   player.start()
   metaTimer = window.setInterval(pollMetadata, META_INTERVAL_MS)
+  loadAIMode()
 })
 
 onUnmounted(() => {
@@ -245,6 +356,35 @@ video {
 .ai-badge {
   opacity: 0.95;
   color: #00dcc8;
+}
+
+.ai-mode-bar {
+  position: absolute;
+  top: 34px;
+  left: 8px;
+  display: flex;
+  gap: 4px;
+}
+
+.mode-btn {
+  padding: 3px 9px;
+  font-size: 11px;
+  color: #cfcfcf;
+  background: rgba(0, 0, 0, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.mode-btn.active {
+  border-color: rgba(0, 220, 200, 0.7);
+  color: #00dcc8;
+  background: rgba(0, 220, 200, 0.12);
+}
+
+.mode-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .player-tools {

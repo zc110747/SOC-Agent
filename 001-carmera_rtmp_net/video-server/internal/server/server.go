@@ -86,9 +86,9 @@ func (s *Server) Start(ctx context.Context) error {
 func printAccessBanner(cfg *config.Config) {
 	sep := strings.Repeat("=", 74)
 	line := strings.Repeat("-", 74)
-	logger.Info(sep)
+	logger.Info("%s", sep)
 	logger.Info(" video-server ready")
-	logger.Info(line)
+	logger.Info("%s", line)
 	if netiface.IsWildcard(cfg.Server.Bind) {
 		logger.Info(" HTTP listen   : %s  (same port on every local IP)", cfg.HTTPListenAddr())
 	} else {
@@ -135,12 +135,12 @@ func printAccessBanner(cfg *config.Config) {
 		}
 	}
 
-	logger.Info(line)
+	logger.Info("%s", line)
 	logger.Info(" RTSP push/pull: rtsp://%s:%d/<stream-path>", cfg.PublicHost(), cfg.RTSP.Port)
 	logger.Info(" WebRTC play   : open the Web UI above (signaling proxied by the server, port %d)", cfg.WebRTC.Port)
 	logger.Info(" HLS (optional): http://%s:%d/<stream-path>/index.m3u8", cfg.PublicHost(), cfg.MediaMTX.HLSPort)
 	logger.Info(" MediaMTX API  : http://%s  (bind=%s, used by the monitor only)", cfg.APIListenAddr(), cfg.MediaMTX.APIBind)
-	logger.Info(line)
+	logger.Info("%s", line)
 	logger.Info(" Media bind    : %s  -> RTSP %d / WebRTC %d / HLS %d",
 		cfg.MediaMTX.Bind, cfg.RTSP.Port, cfg.WebRTC.Port, cfg.MediaMTX.HLSPort)
 	if !loopbackOnly {
@@ -148,7 +148,7 @@ func printAccessBanner(cfg *config.Config) {
 		logger.Info("       firewall first:  scripts\\firewall-add.bat %d %d %d %d",
 			cfg.Server.HTTPPort, cfg.RTSP.Port, cfg.WebRTC.Port, cfg.MediaMTX.HLSPort)
 	}
-	logger.Info(sep)
+	logger.Info("%s", sep)
 }
 
 // Shutdown gracefully stops the HTTP server, MediaMTX and closes the database.

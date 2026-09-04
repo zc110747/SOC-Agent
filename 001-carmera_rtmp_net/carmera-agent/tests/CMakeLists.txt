@@ -16,6 +16,7 @@ set(TEST_SOURCES
 set(APP_SIM_SOURCES
   ${PROJECT_SOURCE_DIR}/src/config/config.cpp
   ${PROJECT_SOURCE_DIR}/src/common/stream_controller.cpp
+  ${PROJECT_SOURCE_DIR}/src/common/http_client_winhttp.cpp
   ${PROJECT_SOURCE_DIR}/src/camera/camera_manager_sim.cpp
   ${PROJECT_SOURCE_DIR}/src/pipeline/video_pipeline_sim.cpp
   ${PROJECT_SOURCE_DIR}/src/rtsp/rtsp_publisher_sim.cpp

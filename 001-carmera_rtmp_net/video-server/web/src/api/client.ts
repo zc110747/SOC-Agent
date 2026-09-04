@@ -40,6 +40,17 @@ export interface StreamInfo {
   hls_direct_url?: string
 }
 
+// ---- AI mode (web-driven model selection) -----------------------------------
+//
+// Three modes the UI can pick. The agent polls the server for the chosen mode
+// and swaps its detector at runtime.
+//   ai-off    -> keep the loaded model, UI just hides the overlay
+//   ai-y      -> person detection only (yolo11n)
+//   ai-y-pose -> person detection + 17 COCO keypoints (yolo11n-pose)
+export type AIMode = 'ai-off' | 'ai-y' | 'ai-y-pose'
+export const AI_MODES: AIMode[] = ['ai-off', 'ai-y', 'ai-y-pose']
+export const DEFAULT_AI_MODE: AIMode = 'ai-y'
+
 // ---- AI metadata (boxes drawn on the video overlay) -------------------------
 
 export interface MetadataObject {
@@ -48,6 +59,8 @@ export interface MetadataObject {
   track_id: number
   /** [x1, y1, x2, y2] in ORIGINAL video pixels. */
   bbox: [number, number, number, number]
+  /** [x, y, conf] per COCO joint, present only for pose models. */
+  keypoints?: [number, number, number][]
 }
 
 export interface MetadataFrame {
@@ -109,5 +122,9 @@ export const api = {
   cameraStream: (id: string) => getJSON<StreamInfo>('/cameras/' + id + '/stream'),
   webrtcOffer: (id: string, sdp: string) =>
     sendJSON<{ type: string; sdp: string }>('/cameras/' + id + '/webrtc', 'POST', { sdp }),
-  cameraMetadata: (id: string) => getJSON<MetadataSnapshot>('/cameras/' + id + '/metadata')
+  cameraMetadata: (id: string) => getJSON<MetadataSnapshot>('/cameras/' + id + '/metadata'),
+  // AI mode: the UI sets the desired mode; the agent polls it and switches.
+  getAIMode: (id: string) => getJSON<{ mode: AIMode }>('/cameras/' + id + '/aimode'),
+  setAIMode: (id: string, mode: AIMode) =>
+    sendJSON<{ mode: AIMode }>('/cameras/' + id + '/aimode', 'POST', { mode })
 }

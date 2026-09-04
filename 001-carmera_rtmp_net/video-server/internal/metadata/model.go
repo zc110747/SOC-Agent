@@ -26,6 +26,29 @@ const (
 	TypeStatus = "status"
 )
 
+// AI modes driven by the web UI (see /api/cameras/{id}/aimode).
+const (
+	// AIModeOff means "stop drawing AI on the web UI". The agent keeps its
+	// model loaded; the UI simply hides the overlay.
+	AIModeOff = "ai-off"
+	// AIModeDetect = person detection only (yolo11n).
+	AIModeDetect = "ai-y"
+	// AIModePose = person detection + 17 COCO keypoints (yolo11n-pose).
+	AIModePose = "ai-y-pose"
+)
+
+// DefaultAIMode is reported by GET /aimode before any choice is made.
+const DefaultAIMode = AIModeDetect
+
+// ValidAIMode reports whether s is one of the three supported modes.
+func ValidAIMode(s string) bool {
+	switch s {
+	case AIModeOff, AIModeDetect, AIModePose:
+		return true
+	}
+	return false
+}
+
 // Probe is the first-pass decode target: only "type" is read so the handler can
 // pick the right struct for the real decode. Frame and status messages share no
 // other field, so decoding straight into one struct would silently drop data.
@@ -64,10 +87,14 @@ func InferType(body []byte) string {
 // Object is one detection inside a frame message. BBox is [x1,y1,x2,y2] in
 // ORIGINAL video pixels (never normalised, never scaled).
 type Object struct {
-	Class      string  `json:"class"`
-	Confidence float64 `json:"confidence"`
-	TrackID    int     `json:"track_id"`
-	BBox       [4]int  `json:"bbox"`
+	Class      string       `json:"class"`
+	Confidence float64      `json:"confidence"`
+	TrackID    int          `json:"track_id"`
+	BBox       [4]int       `json:"bbox"`
+	// Keypoints is [x, y, conf] per COCO joint, present only for pose models.
+	// x/y are ORIGINAL video pixels; conf is the model's (already sigmoided)
+	// joint confidence in [0,1].
+	Keypoints [][3]float64 `json:"keypoints,omitempty"`
 }
 
 // FrameMessage is an AI inference result pushed by the agent (type="frame").
@@ -206,10 +233,11 @@ func (f *FrameMessage) Validate() error {
 
 // ObjectView is the stored form of one detection.
 type ObjectView struct {
-	Class      string  `json:"class"`
-	Confidence float64 `json:"confidence"`
-	TrackID    int     `json:"track_id"`
-	BBox       [4]int  `json:"bbox"`
+	Class      string       `json:"class"`
+	Confidence float64      `json:"confidence"`
+	TrackID    int          `json:"track_id"`
+	BBox       [4]int       `json:"bbox"`
+	Keypoints  [][3]float64 `json:"keypoints,omitempty"`
 }
 
 // FrameView is the latest inference result for one camera.

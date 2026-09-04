@@ -2,6 +2,7 @@
 #include "camera_agent/video_pipeline.h"
 #include "camera_agent/rtsp_publisher.h"
 #include "camera_agent/logger.h"
+#include "camera_agent/http_client.h"
 
 #include <chrono>
 #include <iostream>
@@ -11,7 +12,23 @@
 namespace ca {
 namespace {
 std::atomic<bool> g_app_stop{false};
+
+// Minimal "key":"value" JSON string extractor. Good enough for the small,
+// server-controlled aimode payload ({"mode":"ai-y"}). Returns "" when the
+// field is absent or malformed - the poller treats that as "keep current".
+std::string extract_json_string(const std::string& body, const std::string& key) {
+    const std::string needle = "\"" + key + "\"";
+    auto pos = body.find(needle);
+    if (pos == std::string::npos) return "";
+    auto colon = body.find(':', pos + needle.size());
+    if (colon == std::string::npos) return "";
+    auto q1 = body.find('"', colon + 1);
+    if (q1 == std::string::npos) return "";
+    auto q2 = body.find('"', q1 + 1);
+    if (q2 == std::string::npos) return "";
+    return body.substr(q1 + 1, q2 - q1 - 1);
 }
+} // namespace
 
 // Request the active run loop to stop (e.g. from a SIGINT handler).
 void request_app_stop() { g_app_stop = true; }
@@ -112,6 +129,36 @@ void StreamController::start_ai() {
         if (meta_.is_running()) meta_.push_result(r);
     });
     ai_.start();
+    start_aimode_poller();
+}
+
+void StreamController::start_aimode_poller() {
+    if (!cfg_.ai.aimode_poll) return;
+    aimode_thread_ = std::thread(&StreamController::aimode_poll_loop, this);
+}
+
+void StreamController::aimode_poll_loop() {
+    const std::string url = cfg_.ai.aimode_base_url +
+        "/api/cameras/" + cfg_.metadata.camera_id + "/aimode";
+    CA_LOG_INFO("[AI] aimode poller started -> {}", url);
+    const int period_ms = cfg_.ai.aimode_poll_ms > 0 ? cfg_.ai.aimode_poll_ms : 2000;
+    while (running_) {
+        std::string body;
+        if (http_get(url, body, period_ms)) {
+            const std::string mode = extract_json_string(body, "mode");
+            if (mode == "ai-y-pose") {
+                if (ai_.current_mode() != AIMode::Pose) ai_.request_mode(AIMode::Pose);
+            } else if (mode == "ai-y") {
+                if (ai_.current_mode() != AIMode::Detect) ai_.request_mode(AIMode::Detect);
+            }
+            // "ai-off" and unknown: agent keeps its current model (the web UI
+            // simply stops drawing). No notify-back is sent for ai-off.
+        }
+        // Sleep in small slices so stop() is observed quickly.
+        for (int i = 0; i < period_ms / 100 && running_; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    CA_LOG_INFO("[AI] aimode poller stopped");
 }
 
 void StreamController::start_metadata() {
@@ -188,6 +235,8 @@ void StreamController::stop() {
     meta_.stop();
     if (reconnect_thread_.joinable())
         reconnect_thread_.join();
+    if (aimode_thread_.joinable())
+        aimode_thread_.join();
     if (pipeline_) pipeline_->stop();
     if (publisher_) publisher_->disconnect();
     status_ = StreamStatus::DISCONNECTED;

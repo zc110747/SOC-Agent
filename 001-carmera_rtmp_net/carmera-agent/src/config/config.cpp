@@ -161,6 +161,10 @@ bool load_config(Config& cfg, const std::string& path) {
             as_int(find(*n, "full_rate_below_fps"), cfg.ai.full_rate_below_fps);
         cfg.ai.log_objects = as_bool(find(*n, "log_objects"), cfg.ai.log_objects);
         cfg.ai.num_threads = as_int(find(*n, "num_threads"), cfg.ai.num_threads);
+        cfg.ai.model_pose      = as_str(find(*n, "model_pose"), cfg.ai.model_pose);
+        cfg.ai.aimode_poll     = as_bool(find(*n, "aimode_poll"), cfg.ai.aimode_poll);
+        cfg.ai.aimode_poll_ms  = as_int(find(*n, "aimode_poll_ms"), cfg.ai.aimode_poll_ms);
+        cfg.ai.aimode_base_url = as_str(find(*n, "aimode_base_url"), cfg.ai.aimode_base_url);
     }
     // ---- Metadata upload (Phase 2 / spec 9): server address is never hard-coded
     if (auto* n = find(root, "metadata")) {

@@ -51,6 +51,11 @@ static void print_help() {
         "  --ai-model <path>  ONNX model (default models/yolo11n.onnx). Detection\n"
         "                      and pose models are auto-detected; e.g.\n"
         "                      models/yolo11n-pose.onnx adds 17 keypoints per person\n"
+        "  --ai-model-pose <path>  Pose model (default models/yolo11n-pose.onnx)\n"
+        "  --ai-aimode-base <url>  video-server HTTP base for mode polling\n"
+        "                          (default http://127.0.0.1:8081)\n"
+        "  --ai-aimode-poll-ms <n> mode poll period in ms (default 2000)\n"
+        "  --no-ai-aimode    Disable web-driven model switching (fixed at startup)\n"
         "  --ai-input <w> <h> Network input size (default 640 640)\n"
         "  --ai-queue <n>     Bounded frame queue depth (default 2)\n"
         "  --ai-full-rate-below <n>\n"
@@ -125,6 +130,10 @@ int main(int argc, char** argv) {
         int  ai_fps_v=0, ai_w_v=0, ai_h_v=0, ai_queue_v=0, ai_frb_v=0;
         float ai_conf_v=0;
         std::string ai_model_v;
+        // Runtime AI mode switching
+        bool ai_model_pose=false, ai_aimode_base=false, ai_aimode_poll_ms=false, ai_aimode_off=false;
+        std::string ai_model_pose_v, ai_aimode_base_v;
+        int  ai_aimode_poll_ms_v=0;
         // Metadata overrides
         bool md=false, md_no=false, md_url=false, md_cam=false, md_queue=false;
         bool md_timeout=false, md_hb=false, md_log_payload=false, md_insecure=false;
@@ -164,6 +173,13 @@ int main(int argc, char** argv) {
         else if (a == "--ai-confidence") { cli.ai_conf = true;
                                           cli.ai_conf_v = (float)std::atof(get_val(i++, "--ai-confidence").c_str()); }
         else if (a == "--ai-model")  { cli.ai_model = true; cli.ai_model_v = get_val(i++, "--ai-model"); }
+        else if (a == "--ai-model-pose") { cli.ai_model_pose = true;
+                                           cli.ai_model_pose_v = get_val(i++, "--ai-model-pose"); }
+        else if (a == "--ai-aimode-base") { cli.ai_aimode_base = true;
+                                            cli.ai_aimode_base_v = get_val(i++, "--ai-aimode-base"); }
+        else if (a == "--ai-aimode-poll-ms") { cli.ai_aimode_poll_ms = true;
+                                               cli.ai_aimode_poll_ms_v = std::atoi(get_val(i++, "--ai-aimode-poll-ms").c_str()); }
+        else if (a == "--no-ai-aimode") cli.ai_aimode_off = true;
         else if (a == "--ai-queue")  { cli.ai_queue = true; cli.ai_queue_v = std::atoi(get_val(i++, "--ai-queue").c_str()); }
         else if (a == "--ai-full-rate-below") { cli.ai_frb = true;
                                                cli.ai_frb_v = std::atoi(get_val(i++, "--ai-full-rate-below").c_str()); }
@@ -217,6 +233,10 @@ int main(int argc, char** argv) {
     if (cli.ai_fps)  cfg.ai.fps          = cli.ai_fps_v;
     if (cli.ai_conf) cfg.ai.confidence   = cli.ai_conf_v;
     if (cli.ai_model)  cfg.ai.model         = cli.ai_model_v;
+    if (cli.ai_model_pose)  cfg.ai.model_pose      = cli.ai_model_pose_v;
+    if (cli.ai_aimode_base) cfg.ai.aimode_base_url = cli.ai_aimode_base_v;
+    if (cli.ai_aimode_poll_ms) cfg.ai.aimode_poll_ms = cli.ai_aimode_poll_ms_v;
+    if (cli.ai_aimode_off)      cfg.ai.aimode_poll    = false;
     if (cli.ai_w)      cfg.ai.input_width   = cli.ai_w_v;
     if (cli.ai_h)      cfg.ai.input_height  = cli.ai_h_v;
     if (cli.ai_queue)  cfg.ai.queue_size    = cli.ai_queue_v;

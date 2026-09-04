@@ -60,6 +60,11 @@ public:
     // caller keeps a fully functional video stream (spec 3.1 / 19).
     void start_ai();
 
+    // Runtime AI-mode poller: reads the desired mode from the video-server and
+    // requests a model swap on change. Started only when cfg_.ai.aimode_poll.
+    void start_aimode_poller();
+    void aimode_poll_loop();
+
     // Access to the AI branch (never null; enable=false -> idle object).
     AIPipeline&       ai()       { return ai_; }
     const AIPipeline& ai() const { return ai_; }
@@ -89,6 +94,9 @@ private:
     BackoffScheduler              backoff_;
     std::thread                   reconnect_thread_;
     std::atomic<bool>             reconnecting_{false};
+
+    // AI-mode poller thread (web UI -> video-server -> model swap).
+    std::thread                   aimode_thread_;
     int                           attempt_ = 0;
 
     // A STREAMING report right after PLAYING is not proof the RTSP server is

@@ -2,6 +2,7 @@ set(SOURCES
   main.cpp
   config/config.cpp
   common/stream_controller.cpp
+  common/http_client_winhttp.cpp
   # AI branch (backend independent: the detector picks its implementation at
   # compile time from CAMERA_AGENT_HAVE_ORT).
   ai/ai_pipeline.cpp

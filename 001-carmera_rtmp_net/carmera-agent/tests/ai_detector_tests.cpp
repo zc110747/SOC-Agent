@@ -374,3 +374,50 @@ TEST(ai_pipeline_lifecycle) {
     if (rgb) stbi_image_free(rgb);
     return true;
 }
+
+// Runtime AI-mode switch (web UI -> video-server -> poller -> apply_mode).
+// Verifies the detector can be swapped Detect<->Pose WITHOUT rebuilding the
+// whole pipeline, and that current_mode()/keypoint_count() track the swap.
+TEST(ai_pipeline_switch_models) {
+    if (!detector_available()) {
+        std::cout << "  [skip] ONNX Runtime not built in\n";
+        return true;
+    }
+    if (!std::ifstream("models/yolo11n.onnx").good() ||
+        !std::ifstream("models/yolo11n-pose.onnx").good()) {
+        std::cout << "  [skip] need models/yolo11n.onnx and "
+                     "models/yolo11n-pose.onnx\n";
+        return true;
+    }
+
+    ca::AIConfig cfg;
+    cfg.enable        = true;
+    cfg.fps           = 5;
+    cfg.model         = "models/yolo11n.onnx";
+    cfg.model_pose    = "models/yolo11n-pose.onnx";
+    cfg.queue_size    = 2;
+    cfg.num_threads   = 1;
+    cfg.log_objects   = false;
+    cfg.input_width   = 640;
+    cfg.input_height  = 640;
+    cfg.confidence    = 0.25f;
+    cfg.low_confidence = 0.1f;
+    cfg.nms_threshold = 0.45f;
+
+    ca::AIPipeline pipe;
+    ASSERT(pipe.init(cfg, 640, 480, 30));
+    ASSERT_EQ(pipe.current_mode(), ca::AIMode::Detect);
+    ASSERT_EQ(pipe.keypoint_count(), 0);
+
+    // Switch to pose at runtime (no pipeline restart).
+    ASSERT(pipe.apply_mode(ca::AIMode::Pose));
+    ASSERT_EQ(pipe.current_mode(), ca::AIMode::Pose);
+    ASSERT_EQ(pipe.keypoint_count(), 17);
+
+    // Switch back to detect.
+    ASSERT(pipe.apply_mode(ca::AIMode::Detect));
+    ASSERT_EQ(pipe.current_mode(), ca::AIMode::Detect);
+    ASSERT_EQ(pipe.keypoint_count(), 0);
+    std::cout << "  runtime model switch detect<->pose OK\n";
+    return true;
+}

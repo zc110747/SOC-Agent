@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -83,7 +84,14 @@ func Migrate(db *sql.DB) error {
 			y1          INTEGER NOT NULL,
 			x2          INTEGER NOT NULL,
 			y2          INTEGER NOT NULL,
+			keypoints   TEXT,
 			received_at TEXT    NOT NULL
+		)`,
+		// Desired AI mode per camera (web UI -> agent poller). Overwritten on
+		// every POST /api/cameras/{id}/aimode.
+		`CREATE TABLE IF NOT EXISTS ai_aimode (
+			camera_id TEXT PRIMARY KEY,
+			mode      TEXT NOT NULL
 		)`,
 		// Serves both the latest-frame lookup and the retention prune.
 		`CREATE INDEX IF NOT EXISTS idx_ai_object_camera_id ON ai_object(camera_id, id)`,
@@ -92,6 +100,47 @@ func Migrate(db *sql.DB) error {
 		if _, err := db.Exec(s); err != nil {
 			return fmt.Errorf("migrate metadata: %w", err)
 		}
+	}
+	// Forward-compatible: an existing joint DB (or any upgraded deployment) may
+	// predate the keypoints column that pose models introduced. CREATE TABLE IF
+	// NOT EXISTS leaves the old table untouched, so every metadata INSERT would
+	// fail with "table ai_object has no column named keypoints". Upgrade the
+	// schema in place instead of forcing a manual DB wipe - the column is simply
+	// added when absent.
+	if err := addColumnIfMissing(db, "ai_object", "keypoints", "TEXT"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// addColumnIfMissing makes a schema forward-compatible with databases created
+// by older binaries. PRAGMA table_info reports the live columns; we ALTER only
+// when the column is genuinely absent, so calling this on a fresh DB is a no-op.
+func addColumnIfMissing(db *sql.DB, table, col, typ string) error {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return fmt.Errorf("pragma table_info(%s): %w", table, err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull int
+		var dflt, pk interface{}
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return fmt.Errorf("scan pragma %s: %w", table, err)
+		}
+		if name == col {
+			found = true
+			break
+		}
+	}
+	if found {
+		return nil
+	}
+	if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, col, typ)); err != nil {
+		return fmt.Errorf("alter %s add %s: %w", table, col, err)
 	}
 	return nil
 }
@@ -124,15 +173,22 @@ func (r *Repository) SaveFrame(f *FrameMessage, received time.Time) error {
 	}
 
 	ins, err := tx.Prepare(`
-		INSERT INTO ai_object (camera_id,frame_id,class,confidence,track_id,x1,y1,x2,y2,received_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`)
+		INSERT INTO ai_object (camera_id,frame_id,class,confidence,track_id,x1,y1,x2,y2,keypoints,received_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return fmt.Errorf("prepare ai_object: %w", err)
 	}
 	defer ins.Close()
 	for _, o := range f.Objects {
+		var kpJSON []byte
+		if len(o.Keypoints) > 0 {
+			if b, merr := json.Marshal(o.Keypoints); merr == nil {
+				kpJSON = b
+			}
+		}
 		if _, err := ins.Exec(f.CameraID, f.FrameID, o.Class, o.Confidence, o.TrackID,
-			o.BBox[0], o.BBox[1], o.BBox[2], o.BBox[3], recv); err != nil {
+			o.BBox[0], o.BBox[1], o.BBox[2], o.BBox[3],
+			nullBytes(kpJSON), recv); err != nil {
 			return fmt.Errorf("insert ai_object: %w", err)
 		}
 	}
@@ -289,7 +345,7 @@ func (r *Repository) status(cameraID string) (*StatusView, error) {
 
 func (r *Repository) objects(cameraID string, frameID int64) ([]ObjectView, error) {
 	rows, err := r.db.Query(`
-		SELECT class,confidence,track_id,x1,y1,x2,y2
+		SELECT class,confidence,track_id,x1,y1,x2,y2,keypoints
 		FROM ai_object WHERE camera_id = ? AND frame_id = ? ORDER BY id ASC`,
 		cameraID, frameID)
 	if err != nil {
@@ -299,9 +355,16 @@ func (r *Repository) objects(cameraID string, frameID int64) ([]ObjectView, erro
 	out := []ObjectView{}
 	for rows.Next() {
 		var o ObjectView
+		var kpJSON sql.NullString
 		if err := rows.Scan(&o.Class, &o.Confidence, &o.TrackID,
-			&o.BBox[0], &o.BBox[1], &o.BBox[2], &o.BBox[3]); err != nil {
+			&o.BBox[0], &o.BBox[1], &o.BBox[2], &o.BBox[3], &kpJSON); err != nil {
 			return nil, err
+		}
+		if kpJSON.Valid && kpJSON.String != "" {
+			if uerr := json.Unmarshal([]byte(kpJSON.String), &o.Keypoints); uerr != nil {
+				logger.Warn("metadata: bad keypoints json for %s frame %d: %v",
+					cameraID, frameID, uerr)
+			}
 		}
 		out = append(out, o)
 	}
@@ -359,6 +422,43 @@ func (r *Repository) DeleteCamera(cameraID string) error {
 	if _, err := r.db.Exec(`DELETE FROM ai_object WHERE camera_id = ?`, cameraID); err != nil {
 		return err
 	}
+	if _, err := r.db.Exec(`DELETE FROM ai_aimode WHERE camera_id = ?`, cameraID); err != nil {
+		return err
+	}
+	return nil
+}
+
+// GetAIMode returns the desired AI mode for a camera. When no choice has been
+// made yet it returns the default (AIModeDetect) and a nil error, so the agent
+// poller and the UI always get a usable value.
+func (r *Repository) GetAIMode(cameraID string) (string, error) {
+	var mode string
+	err := r.db.QueryRow(`SELECT mode FROM ai_aimode WHERE camera_id = ?`, cameraID).
+		Scan(&mode)
+	switch {
+	case err == sql.ErrNoRows:
+		return DefaultAIMode, nil
+	case err != nil:
+		return DefaultAIMode, fmt.Errorf("read ai_aimode: %w", err)
+	}
+	if !ValidAIMode(mode) {
+		return DefaultAIMode, nil
+	}
+	return mode, nil
+}
+
+// SetAIMode records the desired AI mode. Invalid values are rejected so the
+// DB can never hold a mode the agent poller does not understand.
+func (r *Repository) SetAIMode(cameraID, mode string) error {
+	if !ValidAIMode(mode) {
+		return fmt.Errorf("invalid ai mode %q (want ai-off|ai-y|ai-y-pose)", mode)
+	}
+	if _, err := r.db.Exec(`
+		INSERT INTO ai_aimode (camera_id, mode) VALUES (?, ?)
+		ON CONFLICT(camera_id) DO UPDATE SET mode = excluded.mode`,
+		cameraID, mode); err != nil {
+		return fmt.Errorf("upsert ai_aimode: %w", err)
+	}
 	return nil
 }
 
@@ -374,6 +474,15 @@ func nullStr(s string) any {
 		return nil
 	}
 	return s
+}
+
+// nullBytes returns nil for a nil/empty slice so the column stores NULL
+// instead of "null"/"[]"; otherwise it stores the already-marshalled bytes.
+func nullBytes(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
 }
 
 // parseTime is lenient on purpose: a timestamp written by an older build must

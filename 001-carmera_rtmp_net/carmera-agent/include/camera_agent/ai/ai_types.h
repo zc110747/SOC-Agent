@@ -18,6 +18,15 @@
 
 namespace ca {
 
+// Runtime AI mode requested by the web UI (via the video-server aimode
+// endpoint). Detect = person detection only; Pose = person detection + 17
+// COCO keypoints. The agent keeps its own model loaded and swaps it on demand.
+enum class AIMode : int { Detect = 0, Pose = 1 };
+
+inline const char* to_string(AIMode m) {
+    return m == AIMode::Pose ? "pose" : "detect";
+}
+
 // One detected + tracked object.
 struct AIObject {
     std::string class_name = "person";
@@ -73,6 +82,17 @@ struct AIConfig {
     int         full_rate_below_fps = 10;
     bool        log_objects = true;
     int         num_threads = 2;
+
+    // --- Runtime AI mode switching (web UI -> video-server -> agent) -------
+    // Pose model path. Detect uses `model` above. Auto-detected so either ONNX
+    // can be dropped in without code changes.
+    std::string model_pose = "models/yolo11n-pose.onnx";
+    // Poll the video-server for the desired AI mode and swap the loaded model
+    // on change. Disabled when false (model stays fixed at startup).
+    bool        aimode_poll     = true;
+    int         aimode_poll_ms  = 2000;   // poll period
+    // video-server HTTP base used to build GET /api/cameras/{id}/aimode.
+    std::string aimode_base_url = "http://127.0.0.1:8081";
 };
 
 // Runtime statistics of the AI pipeline (spec 16).

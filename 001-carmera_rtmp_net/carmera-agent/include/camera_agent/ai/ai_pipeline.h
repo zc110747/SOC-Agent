@@ -17,6 +17,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #include "camera_agent/ai/ai_types.h"
@@ -52,8 +53,23 @@ public:
     // 0 = detection model; >0 = pose model with this many keypoints per
     // object. Valid after a successful init(), 0 otherwise.
     int keypoint_count() const {
+        // detector_ is swapped under mtx_ by the AI thread (apply_mode), while
+        // this is read from the status-provider thread - guard the read.
+        std::lock_guard<std::mutex> lk(mtx_);
         return detector_ ? detector_->keypoint_count() : 0;
     }
+
+    // --- Runtime AI mode switching (web UI -> video-server -> poller) ------
+    // Current loaded mode (Detect / Pose). Read by the status provider on a
+    // different thread, so it is atomic.
+    AIMode current_mode() const { return current_mode_.load(); }
+    // Request a mode change from the poller thread. Intent only - the AI thread
+    // consumes it in thread_loop() and rebuilds the detector (apply_mode).
+    void request_mode(AIMode m);
+    // Synchronously rebuild the detector for `m`. Returns false (and keeps the
+    // current model) on any load/init failure. Used by the AI thread and by
+    // unit tests; never throws, never stops the video branch.
+    bool apply_mode(AIMode m);
 
 private:
     void thread_loop();
@@ -67,6 +83,12 @@ private:
 
     std::unique_ptr<IDetector> detector_;
     std::unique_ptr<ITracker>  tracker_;
+
+    // Current loaded mode. Written only by the AI thread; read atomically.
+    std::atomic<AIMode> current_mode_{AIMode::Detect};
+    // Pending mode request, guarded by mtx_ (set by request_mode, consumed by
+    // the AI thread in thread_loop).
+    std::optional<AIMode> pending_mode_;
 
     mutable std::mutex       mtx_;
     std::condition_variable  cv_;

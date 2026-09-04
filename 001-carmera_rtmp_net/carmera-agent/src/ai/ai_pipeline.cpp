@@ -126,6 +126,8 @@ bool AIPipeline::init(const AIConfig& cfg, int video_width, int video_height,
                 video_width, video_height, video_fps,
                 full_rate ? "full-rate" : "sub-sampled", cfg.queue_size,
                 interval_ms_);
+    current_mode_.store(detector_->keypoint_count() > 0 ? AIMode::Pose
+                                                         : AIMode::Detect);
     return true;
 }
 
@@ -157,6 +159,53 @@ void AIPipeline::stop() {
         queue_.clear();
     }
     CA_LOG_DEBUG("[AI] pipeline stopped");
+}
+
+void AIPipeline::request_mode(AIMode m) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    pending_mode_ = m;
+}
+
+bool AIPipeline::apply_mode(AIMode m) {
+    // Build a fresh detector for the requested model. The ONNX load is slow
+    // (hundreds of ms); it must NOT run under mtx_ so push_frame() stays
+    // non-blocking. The swap back into detector_ is the only locked step.
+    DetectorConfig dcfg;
+    dcfg.model_path     = (m == AIMode::Pose) ? cfg_.model_pose : cfg_.model;
+    dcfg.input_width    = cfg_.input_width;
+    dcfg.input_height   = cfg_.input_height;
+    dcfg.confidence     = cfg_.confidence;
+    dcfg.low_confidence = cfg_.low_confidence;
+    dcfg.nms_threshold  = cfg_.nms_threshold;
+    dcfg.num_threads    = cfg_.num_threads;
+    dcfg.class_id       = 0;  // person
+
+    std::unique_ptr<IDetector> det;
+    try {
+        det = create_detector();
+    } catch (const std::exception& e) {
+        CA_LOG_ERROR("[AI] model switch to {} failed: factory threw: {}",
+                     to_string(m), e.what());
+        return false;
+    }
+    if (!det) {
+        CA_LOG_ERROR("[AI] model switch to {} failed: factory returned null",
+                     to_string(m));
+        return false;
+    }
+    if (!det->init(dcfg)) {
+        CA_LOG_ERROR("[AI] model switch to {} failed: init {} (video continues)",
+                     to_string(m), dcfg.model_path);
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        detector_ = std::move(det);
+        current_mode_.store(m);
+    }
+    CA_LOG_INFO("[AI] model switched -> mode={} ({})", to_string(m),
+                (m == AIMode::Pose) ? cfg_.model_pose : cfg_.model);
+    return true;
 }
 
 void AIPipeline::push_frame(AIFrame&& f) {
@@ -220,21 +269,48 @@ void AIPipeline::thread_loop() {
             }
         }
 
+        // Consume a pending AI mode request (web UI driven). This runs AFTER
+        // the queue lock above is released so that apply_mode()'s own (internal)
+        // swap lock never nests under it - a nested lock on the same
+        // non-recursive mutex would deadlock the thread. Snapshot the intent,
+        // reset it (so a failed switch is not retried in a busy loop), then
+        // rebuild the detector outside any lock.
+        {
+            std::optional<AIMode> want;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (pending_mode_) {
+                    want = *pending_mode_;
+                    pending_mode_.reset();
+                }
+            }
+            if (want && *want != current_mode_.load()) {
+                apply_mode(*want);  // on failure the current model is kept
+            }
+        }
+
         process(frame);
     }
     CA_LOG_DEBUG("[AI] thread exited");
 }
 
 void AIPipeline::process(AIFrame& f) {
-    if (!detector_ || !tracker_) return;
+    // detector_ may be swapped by apply_mode() (AI thread) between calls; read
+    // the pointer once under lock so a whole frame uses one consistent model.
+    IDetector* det = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        det = detector_.get();
+    }
+    if (!det || !tracker_) return;
 
     const auto t0 = std::chrono::steady_clock::now();
 
     std::vector<Detection> dets;
     bool ok = false;
     try {
-        ok = detector_->detect(f.rgb.empty() ? nullptr : f.rgb.data(),
-                               f.width, f.height, dets);
+        ok = det->detect(f.rgb.empty() ? nullptr : f.rgb.data(),
+                         f.width, f.height, dets);
     } catch (const std::exception& e) {
         CA_LOG_ERROR("[AI] detect() threw: {}", e.what());
         ok = false;
