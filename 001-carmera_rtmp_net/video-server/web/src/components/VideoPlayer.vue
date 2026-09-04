@@ -22,16 +22,17 @@
 
     <!-- AI mode selector. ai-off only hides the overlay (the agent keeps its
          model); ai-y / ai-y-pose POST to the server so the agent polls and
-         swaps its detector. On switch we clear the overlay at once and only
-         resume drawing once an incoming frame matches the new mode - any
-         intermediate frame from the still-swapping model is discarded. -->
+         swaps its detector. The UI flips immediately on click - we do NOT wait
+         for the server round-trip. On switch we clear the overlay at once and
+         only resume drawing once an incoming frame matches the new mode; any
+         intermediate frame from the still-swapping model (stamped with the OLD
+         mode) is dropped by pollMetadata() - never composited as a stale box. -->
     <div class="ai-mode-bar">
       <button
         v-for="m in aiModeOptions"
         :key="m.value"
         class="mode-btn"
         :class="{ active: aiMode === m.value }"
-        :disabled="aiSwitching"
         @click="selectAIMode(m.value)"
       >
         {{ m.label }}
@@ -65,34 +66,26 @@ const props = defineProps<{ cameraId: string }>()
 // ai-y        -> person detection (yolo11n).
 // ai-y-pose   -> person detection + 17 COCO keypoints (yolo11n-pose).
 const aiMode = ref<AIMode>(DEFAULT_AI_MODE)
-const aiSwitching = ref(false)
 const aiModeOptions = [
   { value: 'ai-off' as AIMode, label: 'AI 关' },
   { value: 'ai-y' as AIMode, label: '人检测' },
   { value: 'ai-y-pose' as AIMode, label: '姿态' }
 ]
 
-async function selectAIMode(m: AIMode) {
-  if (aiSwitching.value || m === aiMode.value) return
-  aiSwitching.value = true
-  // Close the AI overlay immediately. The agent is still running the previous
-  // model until its poller swaps the detector (~1s), so its next frames belong
-  // to the OLD mode. pollMetadata() also drops those intermediate frames until
-  // the incoming data matches the newly selected mode - we never composite a
-  // stale detect box over a pose view (or vice versa). This is what prevents
-  // the "multiple boxes" artifact during a switch.
+// Flip the UI selection immediately - the overlay switches at once and any
+// incoming metadata frame whose embedded ai_mode does not match the newly
+// selected mode is dropped by pollMetadata(). We do NOT await the server
+// round-trip: the agent may take ~1s to poll and swap its detector, but the
+// WebRTC <video> keeps playing and stale boxes are cleared on click. The POST
+// is fire-and-forget (async); only a console error is logged if it fails, so a
+// transient network blip never blocks the UI or the running video stream.
+function selectAIMode(m: AIMode) {
+  if (m === aiMode.value) return
   closeOverlayNow()
-  try {
-    // POST the desired mode; the agent polls GET /api/cameras/{id}/aimode and
-    // swaps its detector at runtime. The overlay resumes only once a frame of
-    // the matching mode arrives.
-    await api.setAIMode(props.cameraId, m)
-    aiMode.value = m
-  } catch (e) {
-    console.error('setAIMode failed', e)
-  } finally {
-    aiSwitching.value = false
-  }
+  aiMode.value = m
+  api
+    .setAIMode(props.cameraId, m)
+    .catch((e) => console.error('setAIMode failed', e))
 }
 
 // Clear the overlay canvas right now (called the moment a mode switch starts so
