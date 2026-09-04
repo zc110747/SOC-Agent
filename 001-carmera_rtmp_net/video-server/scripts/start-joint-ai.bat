@@ -64,7 +64,31 @@ REM stale binary is the last thing you want while debugging playback.
 REM The pick lives in :pick_exe because it runs twice - once here, once again
 REM after the optional rebuild below.
 call :pick_exe
-set CA_EXE=%AGENT_DIR%\build-msvc\src\camera-agent.exe
+REM ---- pick the camera-agent binary: prefer the GStreamer (real-camera) build --
+REM Only the GStreamer backend publishes a real RTSP stream that MediaMTX / WebRTC
+REM can play. The SIM build is a headless simulator that NEVER opens a network
+REM connection, so launching it here yields "no stream is available on path ...".
+set CA_EXE=
+set "CA_GST_DIR=%AGENT_DIR%\build-msvc-gst"
+set "CA_SIM_DIR=%AGENT_DIR%\build-msvc"
+if exist "%CA_GST_DIR%\src\camera-agent.exe" (
+  set "CA_EXE=%CA_GST_DIR%\src\camera-agent.exe"
+) else if exist "%CA_SIM_DIR%\src\camera-agent.exe" (
+  set "CA_EXE=%CA_SIM_DIR%\src\camera-agent.exe"
+)
+REM backend marker (written by scripts\build-msvc.ps1) drives the SIM warning
+set "CA_BACKEND=unknown"
+if exist "%CA_GST_DIR%\backend.txt" ( set /p CA_BACKEND=<"%CA_GST_DIR%\backend.txt" )
+if exist "%CA_SIM_DIR%\backend.txt" ( set /p CA_BACKEND=<"%CA_SIM_DIR%\backend.txt" )
+if /i "%CA_BACKEND%"=="sim" (
+  echo.
+  echo [WARN]  camera-agent.exe is a SIM build - it does NOT publish an RTSP stream.
+  echo         WebRTC will report: no stream is available on path '%STREAM_ID%'.
+  echo         For real video + AI tracking boxes, build the GStreamer backend:
+  echo           cd %AGENT_DIR% ^&^& scripts\build-msvc.ps1 -Backend gstreamer
+  echo         then re-run this script. (Continuing so you can see the server UI.)
+  echo.
+)
 
 echo ============================================================
 echo  Joint run (AI): video-server + carmera-agent --ai --metadata

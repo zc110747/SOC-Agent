@@ -11,9 +11,14 @@
 # native Windows form end to end.
 #
 # Usage:
-#   .\scripts\build-msvc.ps1                 # gstreamer backend (default)
-#   .\scripts\build-msvc.ps1 -Backend sim    # SIM backend
+#   .\scripts\build-msvc.ps1                 # gstreamer backend (default, auto-detected)
+#   .\scripts\build-msvc.ps1 -Backend sim    # SIM backend (headless, no camera, NO RTSP publish)
 #   .\scripts\build-msvc.ps1 -Clean          # wipe the build dir first
+#
+# A GStreamer build is written to build-msvc-gst; a SIM build to build-msvc.
+# The joint launch scripts (start-joint*.bat) prefer the GStreamer build because
+# only it publishes a real RTSP stream that MediaMTX / WebRTC can play. Running a
+# SIM binary with them yields "no stream is available on path 'camera01'".
 
 param(
     [ValidateSet('gstreamer', 'sim', 'auto')]
@@ -21,6 +26,13 @@ param(
     [string]$BuildDir = 'build-msvc',
     [switch]$Clean
 )
+
+# Convention: a GStreamer build goes to its own dir (build-msvc-gst) so the SIM
+# build is not clobbered, and the joint launch scripts prefer it for the
+# real-camera (AI) demo. Only redirect when the caller did not override -BuildDir.
+if ($Backend -eq 'gstreamer' -and $BuildDir -eq 'build-msvc') {
+    $BuildDir = 'build-msvc-gst'
+}
 
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
@@ -119,6 +131,18 @@ $cmakeArgs = @(
 "--- configure ---"
 & cmake @cmakeArgs
 if ($LASTEXITCODE -ne 0) { throw "CMake configure failed ($LASTEXITCODE)." }
+
+# Emit a backend marker so the joint launch scripts can refuse a SIM build
+# (SIM never publishes an RTSP stream -> WebRTC "no stream is available").
+$cacheFile = Join-Path $Build 'CMakeCache.txt'
+if (Test-Path $cacheFile) {
+    $line = Select-String -Path $cacheFile -Pattern 'CAMERA_AGENT_BACKEND:STRING=(.+)' |
+            Select-Object -First 1
+    if ($line -and $line -match 'CAMERA_AGENT_BACKEND:STRING=(.+)') {
+        Set-Content -Path (Join-Path $Build 'backend.txt') -Value $Matches[1].Trim()
+        "Backend marker: $($Matches[1].Trim()) -> $(Join-Path $Build 'backend.txt')"
+    }
+}
 
 "--- build ---"
 & cmake --build $Build
