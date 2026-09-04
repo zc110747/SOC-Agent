@@ -84,9 +84,15 @@ func InferType(body []byte) string {
 	return ""
 }
 
+// Keypoint is one pose landmark: [x, y, conf] in ORIGINAL video pixels.
+// It is emitted only by pose models; detection models leave it nil, so the
+// wire format stays byte-compatible with the non-pose protocol.
+type Keypoint [3]float64
+
 // Object is one detection inside a frame message. BBox is [x1,y1,x2,y2] in
 // ORIGINAL video pixels (never normalised, never scaled).
 type Object struct {
+<<<<<<< HEAD
 	Class      string       `json:"class"`
 	Confidence float64      `json:"confidence"`
 	TrackID    int          `json:"track_id"`
@@ -95,6 +101,13 @@ type Object struct {
 	// x/y are ORIGINAL video pixels; conf is the model's (already sigmoided)
 	// joint confidence in [0,1].
 	Keypoints [][3]float64 `json:"keypoints,omitempty"`
+=======
+	Class      string     `json:"class"`
+	Confidence float64    `json:"confidence"`
+	TrackID    int        `json:"track_id"`
+	BBox       [4]int     `json:"bbox"`
+	Keypoints  []Keypoint `json:"keypoints,omitempty"`
+>>>>>>> 123816031189f81cd0f68a62b451edb3eaa6d6b9
 }
 
 // FrameMessage is an AI inference result pushed by the agent (type="frame").
@@ -168,6 +181,19 @@ func (f *FrameMessage) Normalize() (dropped int) {
 		if o.Confidence > 1 {
 			o.Confidence = 1
 		}
+		// Pose landmarks: clamp coords into the frame and conf into [0,1].
+		// The agent already does this; this is the server-side safety net for
+		// untrusted input (a stray keypoint must not draw off-canvas).
+		for i := range o.Keypoints {
+			k := &o.Keypoints[i]
+			if f.VideoWidth > 0 {
+				k[0] = clampFloat(k[0], 0, float64(f.VideoWidth))
+			}
+			if f.VideoHeight > 0 {
+				k[1] = clampFloat(k[1], 0, float64(f.VideoHeight))
+			}
+			k[2] = clampFloat(k[2], 0, 1)
+		}
 		kept = append(kept, o)
 	}
 	f.Objects = kept
@@ -212,6 +238,16 @@ func clampInt(v, lo, hi int) int {
 	return v
 }
 
+func clampFloat(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
 // Validate reports whether a status message carries enough identity to store.
 func (s *StatusMessage) Validate() error {
 	if s.CameraID == "" {
@@ -237,11 +273,19 @@ func (f *FrameMessage) Validate() error {
 
 // ObjectView is the stored form of one detection.
 type ObjectView struct {
+<<<<<<< HEAD
 	Class      string       `json:"class"`
 	Confidence float64      `json:"confidence"`
 	TrackID    int          `json:"track_id"`
 	BBox       [4]int       `json:"bbox"`
 	Keypoints  [][3]float64 `json:"keypoints,omitempty"`
+=======
+	Class      string     `json:"class"`
+	Confidence float64    `json:"confidence"`
+	TrackID    int        `json:"track_id"`
+	BBox       [4]int     `json:"bbox"`
+	Keypoints  []Keypoint `json:"keypoints,omitempty"`
+>>>>>>> 123816031189f81cd0f68a62b451edb3eaa6d6b9
 }
 
 // FrameView is the latest inference result for one camera.

@@ -57,11 +57,12 @@ bool AIPipeline::init(const AIConfig& cfg, int video_width, int video_height,
     // Sampling policy:
     //   source fps < full_rate_below_fps -> every frame is inferred
     //   otherwise                        -> at most cfg.fps frames per second
+    const int ai_fps = clamp_ai_fps(cfg.fps);  // enforce [5,12] at the use site
     const bool full_rate = (video_fps > 0 && video_fps < cfg.full_rate_below_fps);
     if (full_rate) {
         interval_ms_ = 0;
     } else {
-        interval_ms_ = (cfg.fps > 0) ? (1000 / cfg.fps) : 0;
+        interval_ms_ = (ai_fps > 0) ? (1000 / ai_fps) : 0;
     }
 
     DetectorConfig dcfg;
@@ -98,7 +99,7 @@ bool AIPipeline::init(const AIConfig& cfg, int video_width, int video_height,
     tcfg.track_buffer    = cfg.track_buffer;
     // track_buffer is expressed in "30 fps frames"; tell the tracker the rate at
     // which we actually feed it so the lost-track lifetime stays wall-clock sane.
-    tcfg.frame_rate = full_rate ? (video_fps > 0 ? video_fps : cfg.fps) : cfg.fps;
+    tcfg.frame_rate = full_rate ? (video_fps > 0 ? video_fps : ai_fps) : ai_fps;
     if (tcfg.frame_rate <= 0) tcfg.frame_rate = 1;
 
     try {

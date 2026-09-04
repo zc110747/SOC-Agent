@@ -339,6 +339,64 @@ func TestDecodeAgentFramePayload(t *testing.T) {
 	}
 }
 
+func TestDecodeAgentFramePayloadWithKeypoints(t *testing.T) {
+	raw := `{"version":1,"type":"frame","camera_id":"camera01","frame_id":15230,
+	         "timestamp":1756773210123,"video_width":1280,"video_height":720,
+	         "objects":[{"class":"person","confidence":0.93,"track_id":17,
+	                     "bbox":[812,210,1040,850],
+	                     "keypoints":[[812,210,0.95],[900,400,0.88],[1040,850,0.71]]}]}`
+	var f FrameMessage
+	if err := json.Unmarshal([]byte(raw), &f); err != nil {
+		t.Fatalf("decode frame: %v", err)
+	}
+	if len(f.Objects) != 1 {
+		t.Fatalf("objects = %d, want 1", len(f.Objects))
+	}
+	o := f.Objects[0]
+	if len(o.Keypoints) != 3 {
+		t.Fatalf("keypoints = %d, want 3", len(o.Keypoints))
+	}
+	if o.Keypoints[0] != (Keypoint{812, 210, 0.95}) {
+		t.Errorf("keypoint[0] = %v, want [812 210 0.95]", o.Keypoints[0])
+	}
+	if o.Keypoints[2] != (Keypoint{1040, 850, 0.71}) {
+		t.Errorf("keypoint[2] = %v, want [1040 850 0.71]", o.Keypoints[2])
+	}
+}
+
+// Keypoints must survive the full SaveFrame -> Latest round trip, and a frame
+// without them must store NULL (not an empty array) so the wire format for
+// detection-only models is unchanged.
+func TestSaveFrameRoundTripsKeypoints(t *testing.T) {
+	r := newTestRepo(t, 0)
+	f := &FrameMessage{
+		Version: 1, Type: TypeFrame, CameraID: "camera01", FrameID: 15230,
+		Timestamp: 1756773210123, VideoWidth: 1280, VideoHeight: 720,
+		Objects: []Object{
+			{Class: "person", Confidence: 0.93, TrackID: 17, BBox: [4]int{812, 210, 1040, 850},
+				Keypoints: []Keypoint{{812, 210, 0.95}, {1040, 850, 0.71}}},
+			{Class: "person", Confidence: 0.74, TrackID: 3, BBox: [4]int{10, 20, 100, 200}},
+		},
+	}
+	if err := r.SaveFrame(f, time.Unix(1700000000, 0).UTC()); err != nil {
+		t.Fatalf("SaveFrame: %v", err)
+	}
+	snap, err := r.Latest("camera01")
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if snap.Frame == nil || len(snap.Frame.Objects) != 2 {
+		t.Fatalf("frame objects = %v", snap.Frame)
+	}
+	got := snap.Frame.Objects[0].Keypoints
+	if len(got) != 2 || got[0] != (Keypoint{812, 210, 0.95}) || got[1] != (Keypoint{1040, 850, 0.71}) {
+		t.Errorf("pose object keypoints = %v, want [[812 210 0.95] [1040 850 0.71]]", got)
+	}
+	if snap.Frame.Objects[1].Keypoints != nil {
+		t.Errorf("detection object keypoints = %v, want nil", snap.Frame.Objects[1].Keypoints)
+	}
+}
+
 func TestDecodeAgentStatusPayload(t *testing.T) {
 	raw := `{"version":1,"type":"status","camera_id":"camera01","wall_clock":1756773215000,
 	         "ai":{"enable":true,"running":true,"fps":5.00,

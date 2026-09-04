@@ -147,7 +147,7 @@ bool load_config(Config& cfg, const std::string& path) {
     // ---- AI branch (spec 18): all parameters configurable, none hard-coded ----
     if (auto* n = find(root, "ai")) {
         cfg.ai.enable       = as_bool(find(*n, "enable"), cfg.ai.enable);
-        cfg.ai.fps          = as_int(find(*n, "fps"), cfg.ai.fps);
+        cfg.ai.fps          = clamp_ai_fps(as_int(find(*n, "fps"), cfg.ai.fps));
         cfg.ai.confidence   = as_float(find(*n, "confidence"), cfg.ai.confidence);
         cfg.ai.model        = as_str(find(*n, "model"), cfg.ai.model);
         cfg.ai.input_width  = as_int(find(*n, "input_width"), cfg.ai.input_width);

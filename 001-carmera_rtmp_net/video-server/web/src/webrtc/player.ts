@@ -19,12 +19,25 @@ export interface PlayerStatus {
   needsTap: boolean
 }
 
+<<<<<<< HEAD
 // WebRTC is the only transport now (HLS fallback was removed from the web
 // client). It is the fragile one on phones: it needs UDP/ICE to reach the
 // server and some mobile browsers refuse it on an insecure (http) origin. If
 // it has not produced a picture within this window, we retry WebRTC rather
 // than switching transports.
 const WEBRTC_TIMEOUT_MS = 7000
+=======
+// WebRTC is the ONLY live transport. It is sub-second; HLS is intentionally NOT
+// used for live viewing (seconds of latency, no value for real-time monitoring)
+// and is kept server-side only for a future cached-recording playback feature.
+// If WebRTC has not produced a picture within this window, report the failure
+// instead of silently degrading to a high-latency stream.
+const WEBRTC_TIMEOUT_MS = 7000
+// Limited reconnect for transient blips (network flap / ICE restart). On
+// exhaustion the player stays in 'disconnected' with the error visible - no
+// hidden fallback.
+const MAX_WEBRTC_RETRIES = 2
+>>>>>>> 123816031189f81cd0f68a62b451edb3eaa6d6b9
 
 export class StreamPlayer {
   private video: HTMLVideoElement
@@ -59,6 +72,7 @@ export class StreamPlayer {
     this.connectWebRTC(this.token)
   }
 
+<<<<<<< HEAD
   /** Re-select / reconnect WebRTC (UI toggle). Frequent clicks used to cause an
    *  occasional reset: overlapping connect attempts left two RTCPeerConnections
    *  racing, and a stale watchdog could flip the element away. The fix is a two
@@ -90,6 +104,14 @@ export class StreamPlayer {
     } catch {
       this.switching = false
     }
+=======
+  /** Manual reconnect (UI button). Also used to recover from a shown error. */
+  useWebRTC(): void {
+    this.clearTimers()
+    this.teardownPeer()
+    this.retry = 0
+    this.connectWebRTC()
+>>>>>>> 123816031189f81cd0f68a62b451edb3eaa6d6b9
   }
 
   /** Called on a user tap when autoplay was blocked. */
@@ -125,8 +147,15 @@ export class StreamPlayer {
   }
 
   private currentState(): PlayerState {
+<<<<<<< HEAD
     if (this.retry > 0) return 'reconnecting'
     return 'connecting'
+=======
+    if (this.retry > 0 && this.transport === 'webrtc') return 'reconnecting'
+    if (this.transport === 'webrtc' && this.pc) return 'connected'
+    if (this.transport === 'webrtc') return 'connecting'
+    return 'disconnected'
+>>>>>>> 123816031189f81cd0f68a62b451edb3eaa6d6b9
   }
 
   private clearTimers(): void {
@@ -140,11 +169,22 @@ export class StreamPlayer {
     }
   }
 
+<<<<<<< HEAD
   /** Tear down the active peer + timers, reverting to the off state. Does not
    *  flip `closed`, so a follow-up connect can proceed. */
   private cancelAll(): void {
     this.clearTimers()
     this.teardownPeer()
+=======
+  /** Cancel only the "no media in WEBRTC_TIMEOUT_MS" watchdog. Used when the
+   *  connection actually established (connectionState 'connected') so we don't
+   *  spuriously fail a working stream. Does NOT touch the reconnect timer. */
+  private clearWatchdog(): void {
+    if (this.watchdog !== null) {
+      window.clearTimeout(this.watchdog)
+      this.watchdog = null
+    }
+>>>>>>> 123816031189f81cd0f68a62b451edb3eaa6d6b9
   }
 
   // ------------------------------------------------------------------- webrtc
@@ -152,7 +192,11 @@ export class StreamPlayer {
   private async connectWebRTC(myToken: number): Promise<void> {
     if (this.closed || myToken !== this.token) return
     this.transport = 'webrtc'
+<<<<<<< HEAD
     // Start from a clean <video>: drop any stale srcObject / src so the WebRTC
+=======
+    // Start from a clean <video>: drop any stale src / srcObject so the WebRTC
+>>>>>>> 123816031189f81cd0f68a62b451edb3eaa6d6b9
     // stream we assign on ontrack is the only thing driving it.
     if (this.video.src) {
       this.video.removeAttribute('src')
@@ -162,6 +206,7 @@ export class StreamPlayer {
     this.detail = this.retry === 0 ? 'negotiating WebRTC' : 'retrying WebRTC #' + this.retry
     this.emit({ state: this.retry === 0 ? 'connecting' : 'reconnecting' })
 
+<<<<<<< HEAD
     // Give up on this attempt if no frame arrives in time, rather than spinning
     // forever behind a black rectangle - then retry (no transport switch).
     this.watchdog = window.setTimeout(() => {
@@ -171,6 +216,16 @@ export class StreamPlayer {
       this.teardownPeer()
       this.retry++
       this.scheduleReconnect(myToken)
+=======
+    // Give up on WebRTC if no frame arrives in time, rather than spinning
+    // forever behind a black rectangle. Report the failure (no HLS fallback).
+    this.watchdog = window.setTimeout(() => {
+      this.watchdog = null
+      if (this.transport === 'webrtc') {
+        this.detail = 'WebRTC timed out - no media in ' + WEBRTC_TIMEOUT_MS / 1000 + 's'
+        this.onWebRTCFailure()
+      }
+>>>>>>> 123816031189f81cd0f68a62b451edb3eaa6d6b9
     }, WEBRTC_TIMEOUT_MS)
 
     try {
@@ -226,6 +281,7 @@ export class StreamPlayer {
     }
   }
 
+<<<<<<< HEAD
   private onWebRTCFailure(myToken: number): void {
     if (this.closed || myToken !== this.token) return
     this.teardownPeer()
@@ -233,6 +289,22 @@ export class StreamPlayer {
     // No HLS fallback: keep retrying WebRTC (bounded delay) until it connects
     // or the player is stopped.
     this.scheduleReconnect(myToken)
+=======
+  // WebRTC failure is reported directly - there is no HLS fallback. A few
+  // reconnects cover transient blips; once exhausted the error stays visible
+  // (state 'disconnected') and the user can retry via the WebRTC button.
+  private onWebRTCFailure(): void {
+    if (this.closed) return
+    this.teardownPeer()
+    this.retry++
+    if (this.retry <= MAX_WEBRTC_RETRIES) {
+      this.scheduleReconnect()
+      return
+    }
+    this.transport = null
+    this.detail += ' - WebRTC unavailable (no fallback transport)'
+    this.emit({ state: 'disconnected' })
+>>>>>>> 123816031189f81cd0f68a62b451edb3eaa6d6b9
   }
 
   private scheduleReconnect(myToken: number): void {
@@ -247,13 +319,6 @@ export class StreamPlayer {
     }, delay)
   }
 
-  private clearWatchdog(): void {
-    if (this.watchdog !== null) {
-      window.clearTimeout(this.watchdog)
-      this.watchdog = null
-    }
-  }
-
   private teardownPeer(): void {
     if (this.pc) {
       try {
@@ -266,8 +331,11 @@ export class StreamPlayer {
       }
       this.pc = null
     }
+<<<<<<< HEAD
     // Release the WebRTC MediaStream from the <video> element so a later
     // re-attach starts from a clean element.
+=======
+>>>>>>> 123816031189f81cd0f68a62b451edb3eaa6d6b9
     if (this.video.srcObject) {
       this.video.srcObject = null
     }

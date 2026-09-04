@@ -30,6 +30,7 @@ REM    CAMERA_SOURCE   force a GStreamer source element         (default: auto)
 REM    NO_BROWSER      1 = do not open the browser              (default 0)
 REM    ENABLE_AI       1 = run person detection in the agent    (default 1)
 REM    ENABLE_METADATA 1 = push AI results to the server        (default 1)
+REM    AI_FPS          AI inference rate, range 5-12            (default 8)
 REM    METADATA_URL    full ingest URL                          (default below)
 REM
 REM  Examples:
@@ -37,6 +38,7 @@ REM    scripts\start-joint-ai.bat
 REM    scripts\start-joint-ai.bat --camera 0 --stream cam01
 REM    scripts\start-joint-ai.bat --no-browser
 REM    scripts\start-joint-ai.bat --no-ai          (plain stream, no boxes)
+REM    scripts\start-joint-ai.bat --ai-fps 10      (10 inferences/sec)
 REM
 REM  NOTE: --auto is always passed to the agent. The UVC camera here only does
 REM        240x240@8fps natively, so forcing the 1280x720 from camera-agent.yaml
@@ -102,6 +104,7 @@ if not defined NO_BROWSER     set NO_BROWSER=0
 REM AI + metadata ON by default: the whole point of this script is the boxes.
 if not defined ENABLE_AI      set ENABLE_AI=1
 if not defined ENABLE_METADATA set ENABLE_METADATA=1
+if not defined AI_FPS         set AI_FPS=8
 set "CAMERA_ARG="
 set "SOURCE_ARG="
 set "AI_ARG="
@@ -113,12 +116,14 @@ for %%a in (%*) do (
     if "!_ctx!"=="camera" set "CAMERA_ID=%%~a"
     if "!_ctx!"=="stream" set "STREAM_ID=%%~a"
     if "!_ctx!"=="source" set "CAMERA_SOURCE=%%~a"
+    if "!_ctx!"=="aifps"  set "AI_FPS=%%~a"
     set "_ctx="
   ) else (
     if /i "%%a"=="--no-browser"   set NO_BROWSER=1
     if /i "%%a"=="--camera"       set "_ctx=camera"
     if /i "%%a"=="--stream"       set "_ctx=stream"
     if /i "%%a"=="--source"       set "_ctx=source"
+    if /i "%%a"=="--ai-fps"       set "_ctx=aifps"
     if /i "%%a"=="--ai"           set ENABLE_AI=1
     if /i "%%a"=="--no-ai"        set ENABLE_AI=0
     if /i "%%a"=="--metadata"     set ENABLE_METADATA=1
@@ -282,7 +287,7 @@ if not defined CAMERA_ID (
 REM ---- (7) start camera-agent, pushing at the SAME MediaMTX ------------
 REM AI / metadata flags are appended only when enabled. In this script they are
 REM ON by default, so the browser overlay has frames to draw.
-if "%ENABLE_AI%"=="1" set "AI_ARG=--ai"
+if "%ENABLE_AI%"=="1" set "AI_ARG=--ai --ai-fps %AI_FPS%"
 if "%ENABLE_METADATA%"=="1" (
   if not defined METADATA_URL set "METADATA_URL=http://127.0.0.1:%HTTP_PORT%/api/metadata"
   REM Delayed expansion on purpose: %AI_ARG% inside a parenthesised block
@@ -333,12 +338,11 @@ if "%SHOW_LAN%"=="1" (
   echo     scripts\firewall-add.bat %HTTP_PORT% %RTSP_PORT%
 )
 echo  Camera      : index %CAMERA_ID%  - negotiated natively via --auto
-echo  AI          : person detection ON - results pushed to server
+echo  AI          : person detection ON - inference rate %AI_FPS% fps (range 5-12)
 echo  Metadata    : http://127.0.0.1:%HTTP_PORT%/api/metadata
 echo                read back: GET http://localhost:%HTTP_PORT%/api/cameras/%STREAM_ID%/metadata
 echo  Box overlay : VideoPlayer.vue polls the metadata above and draws boxes
 echo                on a canvas over the video (label = class + confidence %%)
-if "%ENABLE_AI%"=="1" echo  AI          : person detection on - results stay inside the agent
 if "%ENABLE_METADATA%"=="1" echo  Metadata    : !METADATA_URL!
 echo  Logs        : %LOGS%\  (video-server.log / agent.log)
 echo  Verify      : python scripts\verify_joint.py

@@ -92,6 +92,7 @@ func Migrate(db *sql.DB) error {
 			return fmt.Errorf("migrate metadata: %w", err)
 		}
 	}
+<<<<<<< HEAD
 	// Forward-compatible: an existing joint DB (or any upgraded deployment) may
 	// predate the keypoints column that pose models introduced. CREATE TABLE IF
 	// NOT EXISTS leaves the old table untouched, so every metadata INSERT would
@@ -137,8 +138,31 @@ func addColumnIfMissing(db *sql.DB, table, col, typ string) error {
 	}
 	if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, col, typ)); err != nil {
 		return fmt.Errorf("alter %s add %s: %w", table, col, err)
+=======
+	// Existing databases were created before the keypoints column existed.
+	// ADD COLUMN is a no-op on a fresh DB (the CREATE above already has it);
+	// on an old DB it backfills the nullable column without touching rows.
+	if err := addColumnIfMissing(db, "ai_object", "keypoints", "TEXT"); err != nil {
+		return fmt.Errorf("migrate ai_object.keypoints: %w", err)
+>>>>>>> 123816031189f81cd0f68a62b451edb3eaa6d6b9
 	}
 	return nil
+}
+
+// addColumnIfMissing issues ALTER TABLE ... ADD COLUMN only when the column is
+// absent, so Migrate is safe to re-run on databases of any age.
+func addColumnIfMissing(db *sql.DB, table, column, typ string) error {
+	rows, err := db.Query("SELECT 1 FROM pragma_table_info(?) WHERE name = ?", table, column)
+	if err != nil {
+		return err
+	}
+	exists := rows.Next()
+	rows.Close()
+	if exists {
+		return nil
+	}
+	_, err = db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + typ)
+	return err
 }
 
 const timeFmt = time.RFC3339Nano
@@ -204,8 +228,12 @@ func (r *Repository) saveFrameOnce(f *FrameMessage, received time.Time) error {
 			}
 		}
 		if _, err := ins.Exec(f.CameraID, f.FrameID, o.Class, o.Confidence, o.TrackID,
+<<<<<<< HEAD
 			o.BBox[0], o.BBox[1], o.BBox[2], o.BBox[3],
 			nullBytes(kpJSON), recv); err != nil {
+=======
+			o.BBox[0], o.BBox[1], o.BBox[2], o.BBox[3], kpJSON(o), recv); err != nil {
+>>>>>>> 123816031189f81cd0f68a62b451edb3eaa6d6b9
 			return fmt.Errorf("insert ai_object: %w", err)
 		}
 	}
@@ -372,7 +400,22 @@ func (r *Repository) status(cameraID string) (*StatusView, error) {
 	return &s, nil
 }
 
+// kpJSON marshals an object's pose keypoints to JSON for storage, or nil when
+// the object has none (detection model) so the column stays NULL and the wire
+// format for non-pose frames is unchanged.
+func kpJSON(o Object) interface{} {
+	if len(o.Keypoints) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(o.Keypoints)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
 func (r *Repository) objects(cameraID string, frameID int64) ([]ObjectView, error) {
+<<<<<<< HEAD
 	var rows *sql.Rows
 	if err := dbutil.RetryOnBusy(3, func() error {
 		var e error
@@ -382,12 +425,20 @@ func (r *Repository) objects(cameraID string, frameID int64) ([]ObjectView, erro
 			cameraID, frameID)
 		return e
 	}); err != nil {
+=======
+	rows, err := r.db.Query(`
+		SELECT class,confidence,track_id,x1,y1,x2,y2,keypoints
+		FROM ai_object WHERE camera_id = ? AND frame_id = ? ORDER BY id ASC`,
+		cameraID, frameID)
+	if err != nil {
+>>>>>>> 123816031189f81cd0f68a62b451edb3eaa6d6b9
 		return nil, fmt.Errorf("read ai_object: %w", err)
 	}
 	defer rows.Close()
 	out := []ObjectView{}
 	for rows.Next() {
 		var o ObjectView
+<<<<<<< HEAD
 		var kpJSON sql.NullString
 		if err := rows.Scan(&o.Class, &o.Confidence, &o.TrackID,
 			&o.BBox[0], &o.BBox[1], &o.BBox[2], &o.BBox[3], &kpJSON); err != nil {
@@ -397,6 +448,17 @@ func (r *Repository) objects(cameraID string, frameID int64) ([]ObjectView, erro
 			if uerr := json.Unmarshal([]byte(kpJSON.String), &o.Keypoints); uerr != nil {
 				logger.Warn("metadata: bad keypoints json for %s frame %d: %v",
 					cameraID, frameID, uerr)
+=======
+		var kp []byte
+		if err := rows.Scan(&o.Class, &o.Confidence, &o.TrackID,
+			&o.BBox[0], &o.BBox[1], &o.BBox[2], &o.BBox[3], &kp); err != nil {
+			return nil, err
+		}
+		if len(kp) > 0 {
+			var ks []Keypoint
+			if err := json.Unmarshal(kp, &ks); err == nil {
+				o.Keypoints = ks
+>>>>>>> 123816031189f81cd0f68a62b451edb3eaa6d6b9
 			}
 		}
 		out = append(out, o)

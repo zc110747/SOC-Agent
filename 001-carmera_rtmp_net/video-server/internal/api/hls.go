@@ -42,18 +42,40 @@ func (h *Handler) hlsProxy(w http.ResponseWriter, r *http.Request) {
 		target += "?" + r.URL.RawQuery
 	}
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
-	if err != nil {
-		http.Error(w, "bad upstream request", http.StatusBadGateway)
-		return
-	}
 	// Session affinity: MediaMTX mints per-session HLS sessions and expects the
 	// same reader to come back, so forward the query it gave us verbatim (done
 	// above) and keep the request anonymous beyond that.
-	resp, err := hlsClient.Do(req)
-	if err != nil {
-		logger.Debug("hls proxy %s -> %v", target, err)
-		http.Error(w, "hls upstream unreachable: "+err.Error(), http.StatusBadGateway)
+	// Retry only transient transport errors for a short window - MediaMTX's HLS
+	// endpoint can bind a few hundred ms after its control API is ready, so the
+	// first request right after a server start would otherwise 502. Logical
+	// status codes (e.g. 404 when a stream is not yet published) return at once.
+	const tries = 4
+	var lastErr error
+	var resp *http.Response
+	for attempt := 0; attempt < tries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-r.Context().Done():
+				http.Error(w, "request canceled", http.StatusBadGateway)
+				return
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
+		if err != nil {
+			http.Error(w, "bad upstream request", http.StatusBadGateway)
+			return
+		}
+		resp, err = hlsClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue // upstream not reachable yet - retry
+		}
+		break
+	}
+	if resp == nil {
+		logger.Debug("hls proxy %s -> %v", target, lastErr)
+		http.Error(w, "hls upstream unreachable: "+lastErr.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()

@@ -34,9 +34,11 @@ export interface StreamInfo {
     signaling: string
     path: string
   }
-  /** Same-origin HLS playlist, proxied by the server (fallback for phones). */
+  /** Same-origin HLS playlist, proxied by the server. Reserved for a future
+   *  cached-recording playback feature - NOT used by the live player (live
+   *  viewing is WebRTC only; HLS adds seconds of latency). */
   hls_url?: string
-  /** Direct MediaMTX HLS URL, for debugging with an external player. */
+  /** Direct MediaMTX HLS URL, for debugging / future playback with an external player. */
   hls_direct_url?: string
 }
 
@@ -59,7 +61,12 @@ export interface MetadataObject {
   track_id: number
   /** [x1, y1, x2, y2] in ORIGINAL video pixels. */
   bbox: [number, number, number, number]
+<<<<<<< HEAD
   /** [x, y, conf] per COCO joint, present only for pose models. */
+=======
+  /** Pose landmarks [x, y, conf] in ORIGINAL video pixels. Present only for
+   *  pose models; detection-only output omits it. */
+>>>>>>> 123816031189f81cd0f68a62b451edb3eaa6d6b9
   keypoints?: [number, number, number][]
 }
 

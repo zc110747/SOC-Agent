@@ -78,9 +78,23 @@ struct AIFrame {
 // Every value is configurable - nothing here is hard-coded at the call site.
 // Kept in this header (pure data, no thread/mutex dependencies) so config.h can
 // embed it without pulling in the whole AI implementation.
+
+// AI inference-rate bounds (configurable range, never hard-coded at call sites).
+constexpr int kAiFpsMin     = 5;    // lower bound, fps
+constexpr int kAiFpsMax     = 12;   // upper bound, fps
+constexpr int kAiFpsDefault = 8;    // default, fps
+
+// Clamp a requested inference rate into [kAiFpsMin, kAiFpsMax]; tolerates a
+// reversed range so it can never be UB (mirrors metadata_encoder.cpp clampi).
+inline int clamp_ai_fps(int v) {
+    if (v < kAiFpsMin) return kAiFpsMin;
+    if (v > kAiFpsMax) return kAiFpsMax;
+    return v;
+}
+
 struct AIConfig {
     bool        enable      = false;
-    int         fps         = 5;      // target inference rate
+    int         fps         = kAiFpsDefault;  // target inference rate (range 5-12)
     float       confidence  = 0.5f;   // detector + tracker gate
     std::string model       = "models/yolo11n.onnx";
     int         input_width  = 640;
