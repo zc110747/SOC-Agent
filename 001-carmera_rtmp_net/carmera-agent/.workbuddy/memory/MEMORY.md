@@ -21,7 +21,7 @@ Windows PC 摄像头 → GStreamer → H.264 → RTSP 推流，模拟未来 RK35
 - `rtspclientsink` 自带 RTP payloader，管线里不要串 `rtph264pay`。
 
 ## 验收
-- 单测 **27/27**（10 基础 + AI/YOLO11 解码/pose 真模型回归/运行时 AI 模式切换 + Metadata）；
+- 单测 **29/29**（10 基础 + AI/YOLO11 解码/pose 真模型回归/运行时 AI 模式切换 + Metadata；+2 metadata 编码器盖戳 ai_mode 测试）；
   端到端 `scripts/e2e-test.ps1`（MediaMTX 收流 + ffmpeg 拉帧 + 断服重连 + auto-resume）。
 - auto-resume 判定读 mediamtx.log（实时刷盘），不读 agent.log（stdout 缓冲陈旧）。
 - Metadata 验收用 `scripts/metadata-mock-server.py`（仅标准库；`--dump` / `--fail-after N` / `--die-after N`）。
@@ -62,6 +62,11 @@ Windows PC 摄像头 → GStreamer → H.264 → RTSP 推流，模拟未来 RK35
   `{"mode":"ai-y-pose"}` → agent `aimode_poll_loop` 轮询命中 → 日志 `model switched -> mode=pose`（加载 yolo11n-pose.onnx），
   `POST ai-y` → `model switched -> mode=detect`，**全程不重启**。ai-off 仅 Web 隐藏 overlay，agent 保持启动模型。
   video-server API live 冒烟 8/8 通过（默认 ai-y / 往返 / 非法 400 / ai-off / 新相机默认）。
+- **切换期丢帧统一规则（本续做修正第二版）**：AI Meta 在 payload 内**自带 agent 实际运行模式** `ai_mode`
+ （`ai-y`/`ai-y-pose`），由 agent `current_mode_` 逐帧盖；前端只合成 `嵌入模式 == 选中模式` 的帧，否则 `clearOverlay`
+  丢弃——**只动 `<canvas>` overlay，绝不碰 WebRTC `<video>`**。从而 `ai-off` 也被统一（无帧被盖 `ai-y-off`，旧帧天然 mismatch）。
+  早前 live `GET /metadata` 看似缺 `ai_mode` 实为读到了切换前的旧 NULL 帧（`omitempty` 省略），`ai_frame.ai_mode` 列经
+  `addColumnIfMissing` 已自愈；SIM 后端无人脸不跑推理，故 agent 盖戳 live 演示需真机/带人帧。
 
 ## video-server schema 前向兼容（2026-09-04 修）
 - 现象：joint 运行 agent 推 metadata 时 server 回 `HTTP 500` —— `table ai_object has no column named keypoints`。

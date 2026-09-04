@@ -119,6 +119,11 @@ std::string encode_frame_metadata(const AIFrameResult& r, const MetadataConfig& 
     s += ",\"timestamp\":" + std::to_string(r.timestamp);
     s += ",\"video_width\":" + std::to_string(r.video_width);
     s += ",\"video_height\":" + std::to_string(r.video_height);
+    // Mode the agent actually ran for this frame ("ai-y" / "ai-y-pose"). Older
+    // servers ignore the field; the web uses it to drop transition frames.
+    if (!r.ai_mode.empty()) {
+        s += ",\"ai_mode\":" + jstr(r.ai_mode);
+    }
     s += ",\"objects\":[";
     for (size_t i = 0; i < r.objects.size(); ++i) {
         const AIObject& o = r.objects[i];

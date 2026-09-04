@@ -69,6 +69,7 @@ func Migrate(db *sql.DB) error {
 			timestamp     INTEGER NOT NULL,
 			video_width   INTEGER NOT NULL DEFAULT 0,
 			video_height  INTEGER NOT NULL DEFAULT 0,
+			ai_mode       TEXT,
 			object_count  INTEGER NOT NULL DEFAULT 0,
 			received_at   TEXT NOT NULL,
 			updated_at    TEXT NOT NULL
@@ -108,6 +109,11 @@ func Migrate(db *sql.DB) error {
 	// schema in place instead of forcing a manual DB wipe - the column is simply
 	// added when absent.
 	if err := addColumnIfMissing(db, "ai_object", "keypoints", "TEXT"); err != nil {
+		return err
+	}
+	// Same forward-compat for the per-frame AI mode column introduced to let
+	// the web drop transition frames: older joint DBs have ai_frame without it.
+	if err := addColumnIfMissing(db, "ai_frame", "ai_mode", "TEXT"); err != nil {
 		return err
 	}
 	return nil
@@ -160,15 +166,16 @@ func (r *Repository) SaveFrame(f *FrameMessage, received time.Time) error {
 	defer tx.Rollback()
 
 	if _, err := tx.Exec(`
-		INSERT INTO ai_frame (camera_id,frame_id,timestamp,video_width,video_height,object_count,received_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?)
+		INSERT INTO ai_frame (camera_id,frame_id,timestamp,video_width,video_height,ai_mode,object_count,received_at,updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(camera_id) DO UPDATE SET
 			frame_id=excluded.frame_id, timestamp=excluded.timestamp,
 			video_width=excluded.video_width, video_height=excluded.video_height,
+			ai_mode=excluded.ai_mode,
 			object_count=excluded.object_count,
 			received_at=excluded.received_at, updated_at=excluded.updated_at`,
 		f.CameraID, f.FrameID, f.Timestamp, f.VideoWidth, f.VideoHeight,
-		len(f.Objects), recv, now); err != nil {
+		f.AIMode, len(f.Objects), recv, now); err != nil {
 		return fmt.Errorf("upsert ai_frame: %w", err)
 	}
 
@@ -234,12 +241,13 @@ func (r *Repository) Latest(cameraID string) (Snapshot, error) {
 	var (
 		frameID, ts    int64
 		w, h, objCount int
+		aiMode         string
 		receivedAt     string
 	)
 	err := r.db.QueryRow(`
-		SELECT frame_id,timestamp,video_width,video_height,object_count,received_at
+		SELECT frame_id,timestamp,video_width,video_height,ai_mode,object_count,received_at
 		FROM ai_frame WHERE camera_id = ?`, cameraID).
-		Scan(&frameID, &ts, &w, &h, &objCount, &receivedAt)
+		Scan(&frameID, &ts, &w, &h, &aiMode, &objCount, &receivedAt)
 	switch {
 	case err == nil:
 		objs, oerr := r.objects(cameraID, frameID)
@@ -251,6 +259,7 @@ func (r *Repository) Latest(cameraID string) (Snapshot, error) {
 			Timestamp:   ts,
 			VideoWidth:  w,
 			VideoHeight: h,
+			AIMode:      aiMode,
 			ObjectCount: objCount,
 			ReceivedAt:  parseTime(receivedAt),
 			Objects:     objs,

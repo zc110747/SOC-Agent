@@ -68,6 +68,10 @@ export interface MetadataFrame {
   timestamp: number
   video_width: number
   video_height: number
+  /** Mode the agent actually ran for this frame ("ai-y" / "ai-y-pose").
+   *  Empty for frames from agents that predate the field. The UI drops any
+   *  frame whose mode does not match the selected mode. */
+  ai_mode?: string
   object_count: number
   received_at: string
   objects: MetadataObject[]

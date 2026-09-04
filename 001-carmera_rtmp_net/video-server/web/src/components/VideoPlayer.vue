@@ -176,17 +176,6 @@ const KP_MIN_CONF = 0.2
 // layout. Missing frame / 0 detected objects simply clears the canvas.
 const META_INTERVAL_MS = 200
 
-// Infer the model that produced a metadata frame. A pose frame carries 17
-// keypoints per object; a detection frame carries only bboxes. This lets us
-// drop frames from the previous model during a runtime detector swap.
-function dataModeOf(snap: MetadataSnapshot): AIMode | 'none' {
-  if (!snap.frame || snap.frame.objects.length === 0) return 'none'
-  const hasPose = snap.frame.objects.some(
-    (o) => o.keypoints != null && o.keypoints.length === 17
-  )
-  return hasPose ? 'ai-y-pose' : 'ai-y'
-}
-
 async function pollMetadata() {
   const canvas = canvasEl.value
   const video = videoEl.value
@@ -205,21 +194,17 @@ async function pollMetadata() {
     return
   }
 
-  // ai-off: the agent keeps its model, we just do not draw anything.
-  if (aiMode.value === 'ai-off') {
-    clearOverlay(canvas, ctx)
-    aiOn.value = false
-    objectCount.value = 0
-    return
-  }
-
-  // Infer which model produced this frame. While the agent is still swapping
-  // detectors after a web switch it may emit frames from the *previous* model
-  // (detect -> bbox only; pose -> bbox + 17 keypoints). Drop those intermediate
-  // frames so the UI never composites a stale/mismatched box or skeleton. We
-  // only draw once the incoming data agrees with the selected mode.
-  const dataMode = dataModeOf(snap)
-  if (dataMode !== 'none' && dataMode !== aiMode.value) {
+  // Unified UI rule: only composite a metadata frame whose embedded ai_mode
+  // equals the selected mode. Each frame is stamped by the agent with the mode
+  // it ACTUALLY ran, so during a runtime detector swap (the agent keeps
+  // emitting the previous model for ~1s) those transition frames carry the OLD
+  // mode and are dropped here - never composited as a stale box/skeleton.
+  // "ai-off" is unified by the same rule: no frame is ever stamped "ai-off", so
+  // every frame mismatches and is discarded. This only touches the overlay
+  // <canvas>; the WebRTC <video> keeps playing, so the video stream never
+  // stutters or drops frames.
+  const frameMode = snap.frame?.ai_mode
+  if (!frameMode || frameMode !== aiMode.value) {
     clearOverlay(canvas, ctx)
     aiOn.value = false
     objectCount.value = 0

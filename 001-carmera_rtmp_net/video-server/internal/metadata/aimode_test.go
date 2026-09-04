@@ -2,7 +2,9 @@ package metadata
 
 import (
 	"database/sql"
+	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -125,6 +127,42 @@ func TestDeleteCameraRemovesAIMode(t *testing.T) {
 	}
 }
 
+// Regression: the per-frame AI mode must survive the round trip so the web can
+// drop transition frames. The agent stamps ai_mode with the mode it ACTUALLY
+// ran; during a detector swap the still-running previous model emits the old
+// mode, and the web discards those until the new mode arrives.
+func TestSaveFrameRoundTripsAIMode(t *testing.T) {
+	r := newTestRepo(t, 0)
+	f := sampleFrame("camera01", 15230)
+	f.AIMode = AIModePose
+	if err := r.SaveFrame(f, time.Unix(1700000000, 0).UTC()); err != nil {
+		t.Fatalf("SaveFrame: %v", err)
+	}
+	snap, err := r.Latest("camera01")
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if snap.Frame == nil {
+		t.Fatalf("Frame nil after save")
+	}
+	if snap.Frame.AIMode != AIModePose {
+		t.Errorf("AIMode = %q, want %q", snap.Frame.AIMode, AIModePose)
+	}
+
+	// A detection-mode frame overwrites and the mode flips to detect.
+	f.AIMode = AIModeDetect
+	if err := r.SaveFrame(f, time.Unix(1700000001, 0).UTC()); err != nil {
+		t.Fatalf("SaveFrame (detect): %v", err)
+	}
+	snap, err = r.Latest("camera01")
+	if err != nil {
+		t.Fatalf("Latest (detect): %v", err)
+	}
+	if snap.Frame.AIMode != AIModeDetect {
+		t.Errorf("AIMode = %q, want %q (mode must follow the frame)", snap.Frame.AIMode, AIModeDetect)
+	}
+}
+
 // Regression: a joint DB created before the keypoints column existed must keep
 // working after an upgrade. CREATE TABLE IF NOT EXISTS cannot add a column to a
 // table that already exists, so the agent's pose metadata would otherwise fail
@@ -179,5 +217,81 @@ func TestMigrateAddsKeypointsColumnToExistingDB(t *testing.T) {
 	}
 	if len(snap.Frame.Objects[0].Keypoints) != 2 {
 		t.Fatalf("keypoints = %d, want 2 (column added by Migrate)", len(snap.Frame.Objects[0].Keypoints))
+	}
+}
+
+// Regression: a joint DB created before the per-frame ai_mode column existed
+// must keep working after an upgrade. CREATE TABLE IF NOT EXISTS cannot add a
+// column to a table that already exists, so the agent's stamped mode would
+// otherwise fail with "table ai_frame has no column named ai_mode". Migrate
+// must ALTER the existing table in place, after which frames persist their mode.
+func TestMigrateAddsAIModeColumnToExistingDB(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "legacy.db")+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	db.SetMaxOpenConns(1)
+
+	// Simulate the older schema: ai_frame WITHOUT the ai_mode column.
+	if _, err := db.Exec(`
+		CREATE TABLE ai_frame (
+			camera_id     TEXT PRIMARY KEY,
+			frame_id      INTEGER NOT NULL,
+			timestamp     INTEGER NOT NULL,
+			video_width   INTEGER NOT NULL DEFAULT 0,
+			video_height  INTEGER NOT NULL DEFAULT 0,
+			object_count  INTEGER NOT NULL DEFAULT 0,
+			received_at   TEXT NOT NULL,
+			updated_at    TEXT NOT NULL
+		)`); err != nil {
+		t.Fatalf("create legacy ai_frame: %v", err)
+	}
+
+	// Upgrading an existing DB must not error and must add the column.
+	if err := Migrate(db); err != nil {
+		t.Fatalf("Migrate on legacy db: %v", err)
+	}
+
+	r := NewRepository(db, 0, 1)
+	f := sampleFrame("camera01", 15230)
+	f.AIMode = AIModePose
+	if err := r.SaveFrame(f, time.Unix(1700000000, 0).UTC()); err != nil {
+		t.Fatalf("SaveFrame after migrate: %v", err)
+	}
+	snap, err := r.Latest("camera01")
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if snap.Frame.AIMode != AIModePose {
+		t.Errorf("AIMode = %q, want %q (column added by Migrate)", snap.Frame.AIMode, AIModePose)
+	}
+}
+
+// Wire format: GET /api/cameras/{id}/metadata marshals a Snapshot exactly as
+// cameraMetadata does. A frame stamped with a mode must carry "ai_mode" on the
+// wire; a legacy frame (empty mode, agent predating the field) must omit it so
+// the web's unified drop rule treats it as a mismatch and discards it.
+func TestFrameViewMarshalAIMode(t *testing.T) {
+	withMode := Snapshot{Frame: &FrameView{
+		FrameID: 1, VideoWidth: 1920, VideoHeight: 1080, AIMode: AIModePose, ObjectCount: 1,
+	}}
+	b, err := json.Marshal(withMode)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"ai_mode":"ai-y-pose"`) {
+		t.Errorf("marshalled frame with mode should include ai_mode: %s", b)
+	}
+
+	legacy := Snapshot{Frame: &FrameView{
+		FrameID: 1, VideoWidth: 1920, VideoHeight: 1080, ObjectCount: 1,
+	}}
+	b, err = json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("marshal legacy: %v", err)
+	}
+	if strings.Contains(string(b), "ai_mode") {
+		t.Errorf("legacy frame should omit ai_mode (web drops it as mismatch): %s", b)
 	}
 }

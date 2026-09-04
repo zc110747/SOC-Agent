@@ -106,7 +106,11 @@ type FrameMessage struct {
 	Timestamp   int64    `json:"timestamp"`
 	VideoWidth  int      `json:"video_width"`
 	VideoHeight int      `json:"video_height"`
-	Objects     []Object `json:"objects"`
+	// AIMode is the mode the agent ACTUALLY ran to produce this frame
+	// ("ai-y" / "ai-y-pose"). The web drops frames whose mode no longer matches
+	// the selected mode - this is what prevents stale boxes during a switch.
+	AIMode string `json:"ai_mode,omitempty"`
+	Objects []Object `json:"objects"`
 }
 
 // AIState is the AI sub-object of a heartbeat message.
@@ -246,6 +250,10 @@ type FrameView struct {
 	Timestamp   int64        `json:"timestamp"`
 	VideoWidth  int          `json:"video_width"`
 	VideoHeight int          `json:"video_height"`
+	// AIMode is the mode the agent ran for this frame. Empty for frames pushed
+	// by agents that predate the field; the web treats a missing mode as
+	// "does not match" and drops the frame.
+	AIMode      string       `json:"ai_mode,omitempty"`
 	ObjectCount int          `json:"object_count"`
 	ReceivedAt  time.Time    `json:"received_at"`
 	Objects     []ObjectView `json:"objects"`

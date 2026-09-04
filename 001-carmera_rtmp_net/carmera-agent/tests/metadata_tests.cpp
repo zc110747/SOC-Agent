@@ -131,6 +131,37 @@ TEST(metadata_encode_empty_frame) {
     return true;
 }
 
+// The per-frame AI mode must be stamped into the wire JSON so the web can drop
+// transition frames during a runtime detector swap. Older agents omit it; the
+// server then treats the (empty) mode as "does not match" and the web drops it.
+TEST(metadata_encode_frame_includes_ai_mode) {
+    ca::MetadataConfig cfg;
+    ca::AIFrameResult r = make_result(15237, 1756773210423ULL, 1280, 720);
+    r.ai_mode = "ai-y-pose";   // stamped by AIPipeline::process() per frame
+    ca::AIObject a;
+    a.class_name = "person";
+    a.confidence = 0.9f;
+    a.track_id   = 5;
+    a.x1 = 10; a.y1 = 20; a.x2 = 30; a.y2 = 40;
+    r.objects.push_back(a);
+
+    const std::string s = ca::encode_frame_metadata(r, cfg);
+    ASSERT(contains(s, "\"ai_mode\":\"ai-y-pose\""));
+    ASSERT(contains(s, "\"type\":\"frame\""));
+    return true;
+}
+
+// An empty ai_mode must NOT emit the field (backward compatible: older agents
+// that do not stamp it leave the field absent rather than sending "").
+TEST(metadata_encode_frame_omits_empty_ai_mode) {
+    ca::MetadataConfig cfg;
+    ca::AIFrameResult r = make_result(15238, 1756773210523ULL, 1280, 720);
+    r.ai_mode = "";   // not stamped
+    const std::string s = ca::encode_frame_metadata(r, cfg);
+    ASSERT(!contains(s, "ai_mode"));
+    return true;
+}
+
 // spec 13: status/heartbeat carries the AI health fields.
 TEST(metadata_encode_status) {
     ca::MetadataConfig cfg;

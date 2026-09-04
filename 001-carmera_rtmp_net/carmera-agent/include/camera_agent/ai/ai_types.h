@@ -27,6 +27,15 @@ inline const char* to_string(AIMode m) {
     return m == AIMode::Pose ? "pose" : "detect";
 }
 
+// Wire vocabulary shared with video-server (model.go AIModeDetect / AIModePose)
+// and the web UI (client.ts AIMode). Each metadata frame is stamped with the
+// mode the agent ACTUALLY used to produce it, so the web can drop transition
+// frames whose mode no longer matches the selected mode. "ai-off" is never
+// stamped here - it is web-only (the overlay is hidden but the model stays).
+inline const char* aimode_web_string(AIMode m) {
+    return m == AIMode::Pose ? "ai-y-pose" : "ai-y";
+}
+
 // One detected + tracked object.
 struct AIObject {
     std::string class_name = "person";
@@ -49,6 +58,10 @@ struct AIFrameResult {
     int      video_width  = 0;
     int      video_height = 0;
     std::vector<AIObject> objects;
+    // Mode the agent ACTUALLY ran to produce this frame ("ai-y" / "ai-y-pose").
+    // Stamped per frame so the web can drop transition frames whose mode no
+    // longer matches the selected mode (see aimode_web_string).
+    std::string ai_mode;
 };
 
 // Raw frame handed from the video pipeline to the AI pipeline.

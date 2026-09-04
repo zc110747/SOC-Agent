@@ -351,6 +351,10 @@ void AIPipeline::process(AIFrame& f) {
     res.timestamp    = f.timestamp;
     res.video_width  = video_w_;
     res.video_height = video_h_;
+    // Stamp the mode this frame was actually produced with. Read atomically so
+    // a mid-switch swap is reflected exactly once the new detector is live;
+    // transition frames keep the OLD mode and are dropped by the web.
+    res.ai_mode      = aimode_web_string(current_mode_.load());
     res.objects.reserve(tracks.size());
     for (const auto& t : tracks) {
         AIObject o;
