@@ -13,6 +13,12 @@ Windows PC 摄像头 → GStreamer → H.264 → RTSP 推流，模拟未来 RK35
   PATH 补 `Windows Kits\10\bin\10.0.26100.0\x64`（rc/mt）。
 - 源码 UTF-8 → MSVC 加 `/utf-8` 消 C4819。目标：零警告。
 - spdlog 由 FetchContent 拉取（需 GitHub 可达）。
+- **后端是编译期宏 `CAMERA_AGENT_BACKEND`（sim/gstreamer/auto），不是运行时旗标**：`auto` 仅当构建期探测到
+  GStreamer 才解析为 gstreamer，否则回退 sim。构建 GStreamer 后端：`scripts/build-msvc.ps1 -Backend gstreamer`
+  （默认落到 `build-msvc-gst`，与 SIM 的 `build-msvc` 分离），脚本会写 `<BuildDir>/backend.txt` 标记。
+- **SIM 后端是 headless 模拟器，绝不向 MediaMTX 推流**（rtsp_publisher_sim.connect 只置 connected_=true 不建连；
+  video_pipeline_sim.run 只数帧）。所以 SIM 包跑 `start-joint*.bat` 必现 `no stream is available on path 'camera01'`
+  / 视频全 offline。**要看实时画面+AI 框必须用 GStreamer 后端 + 本机真实摄像头**。
 
 ## 真实设备约束（本机）
 - 唯一摄像头 "UVC Control"，原生 **240×240 @ 8fps**；默认分辨率协商失败。
